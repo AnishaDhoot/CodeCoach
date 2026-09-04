@@ -1,0 +1,30 @@
+# Virtual Environment
+.venv/
+activate/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / Frontend Build Outputs
+node_modules/
+extension/node_modules/
+.oxlintrc.json
+
+# Databases & Backups
+*.db
+*.db.bak
+*.db-journal
+*.db-wal
+test_*.db
+leetcode_tutor.db
+
+# Environment Variables
+.env
+backend/.env
+
+# IDE, Testing & Logs
+.vscode/
+.pytest_cache/
+backend/.pytest_cache/
+*.log
+
