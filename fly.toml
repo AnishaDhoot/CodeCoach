@@ -1,0 +1,33 @@
+# Fly.io alternative to render.yaml. Provision Postgres separately:
+#   fly postgres create --name codecoach-db
+#   fly postgres attach codecoach-db        # sets DATABASE_URL secret
+#   fly secrets set GROQ_API_KEY=...         # never commit this
+#   fly deploy
+app = "codecoach-backend"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUN_MIGRATIONS = "0"   # release_command owns migrations
+  PORT = "8080"
+  WEB_CONCURRENCY = "2"
+  AI_DAILY_QUOTA_LIMIT = "50"
+  GROQ_MODEL = "openai/gpt-oss-20b"
+
+[deploy]
+  release_command = "alembic upgrade head"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"

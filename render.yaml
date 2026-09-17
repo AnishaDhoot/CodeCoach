@@ -1,0 +1,38 @@
+# Render blueprint — one Postgres database + the FastAPI backend.
+# Deploy: push this repo, then in Render → "New +" → "Blueprint" and pick it.
+# Set the two `sync: false` secrets (GROQ_API_KEY, optionally EXTRA_CORS_ORIGINS)
+# in the dashboard after the first sync.
+services:
+  - type: web
+    name: codecoach-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    # Run migrations exactly once per deploy, before the new version serves traffic.
+    preDeployCommand: "alembic upgrade head"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: codecoach-db
+          property: connectionString
+      - key: RUN_MIGRATIONS      # entrypoint skips migrations; preDeployCommand owns them
+        value: "0"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: AI_DAILY_QUOTA_LIMIT
+        value: "50"
+      - key: GROQ_MODEL
+        value: "openai/gpt-oss-20b"
+      - key: GROQ_API_KEY        # set in dashboard; never commit
+        sync: false
+      - key: EXTRA_CORS_ORIGINS  # optional extra web origins, comma-separated
+        sync: false
+      - key: CHROME_EXTENSION_ID # optional; pin CORS to your published extension id
+        sync: false
+
+databases:
+  - name: codecoach-db
+    plan: basic-256mb
+    databaseName: codecoach
+    user: codecoach

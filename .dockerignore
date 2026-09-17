@@ -1,0 +1,15 @@
+.git/
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+*.db
+*.db-journal
+*.db-wal
+.pytest_cache/
+backend/.pytest_cache/
+# The extension is built/loaded client-side; the backend image doesn't need it.
+extension/
+scripts/
+e2e/
+*.log

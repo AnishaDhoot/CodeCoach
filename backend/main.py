@@ -257,11 +257,19 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+# Additional origins for hosted deploys (comma-separated), e.g. a staging domain.
+ALLOWED_ORIGINS += [o.strip() for o in os.getenv("EXTRA_CORS_ORIGINS", "").split(",") if o.strip()]
+
+# The extension calls the API from its own origin (chrome-extension://<id>). The
+# regex admits any extension id by default; once the Web Store id is fixed, pin it
+# via CHROME_EXTENSION_ID to lock CORS down to your published extension only.
+_ext_id = os.getenv("CHROME_EXTENSION_ID", "").strip()
+_ext_origin_regex = rf"chrome-extension://{_ext_id}" if _ext_id else r"chrome-extension://.*"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"chrome-extension://.*",
+    allow_origin_regex=_ext_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
