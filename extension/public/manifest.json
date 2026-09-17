@@ -1,9 +1,12 @@
 {
   "manifest_version": 3,
   "name": "CodeCoach Agent",
-  "version": "0.1",
+  "version": "1.0.0",
   "description": "Autonomous CodeCoach Agent overlay for LeetCode. Conceptual failure diagnostics and adaptive problem recommendation.",
-  "permissions": ["storage", "scripting", "cookies", "tabs", "alarms"],
+  "permissions": ["storage", "scripting", "tabs", "alarms"],
+  "action": {
+    "default_title": "CodeCoach Agent"
+  },
   "host_permissions": [
     "https://leetcode.com/*",
     "http://localhost:8000/*"

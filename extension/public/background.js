@@ -16,6 +16,47 @@ async function getBackendUrl() {
   return DEFAULT_BACKEND_URL;
 }
 
+// ---------------------------------------------------------------------------
+// Device-token auth (Phase 1). Mint once via POST /auth/register, cache in
+// chrome.storage.local, and attach as `Authorization: Bearer <token>` on every
+// backend call. A single in-flight promise prevents concurrent double-registration.
+// ---------------------------------------------------------------------------
+let _tokenPromise = null;
+
+async function getAuthToken() {
+  try {
+    const data = await chrome.storage.local.get("authToken");
+    if (data && data.authToken) return data.authToken;
+  } catch (e) {
+    console.warn("[DSA Tutor Background] Failed to read auth token:", e);
+  }
+
+  if (_tokenPromise) return _tokenPromise;
+
+  _tokenPromise = (async () => {
+    const baseUrl = await getBackendUrl();
+    const res = await fetch(`${baseUrl}/auth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) throw new Error(`Auth register failed: HTTP ${res.status}`);
+    const { token } = await res.json();
+    if (!token) throw new Error("Auth register returned no token");
+    try {
+      await chrome.storage.local.set({ authToken: token });
+    } catch (e) {
+      console.warn("[DSA Tutor Background] Failed to persist auth token:", e);
+    }
+    return token;
+  })();
+
+  try {
+    return await _tokenPromise;
+  } finally {
+    _tokenPromise = null;
+  }
+}
+
 // Generic JSON POST/GET helper that resolves sendResponse.
 async function backendFetch(path, { method = "GET", body } = {}) {
   const baseUrl = await getBackendUrl();
@@ -23,6 +64,16 @@ async function backendFetch(path, { method = "GET", body } = {}) {
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
+  }
+  // Attach bearer token (best-effort: if registration fails because the backend
+  // is offline, fall through unauthenticated — endpoints are still open in Phase 1).
+  if (path !== "/auth/register") {
+    try {
+      const token = await getAuthToken();
+      if (token) opts.headers["Authorization"] = `Bearer ${token}`;
+    } catch (e) {
+      console.warn("[DSA Tutor Background] Proceeding without auth token:", e);
+    }
   }
   const res = await fetch(`${baseUrl}${path}`, opts);
   if (!res.ok) {
@@ -558,8 +609,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "export_solved_csv") {
     const timeframe = request.payload?.timeframe || "current_week";
-    getBackendUrl().then((baseUrl) => {
-      fetch(`${baseUrl}/export/solved-csv?timeframe=${encodeURIComponent(timeframe)}`)
+    Promise.all([getBackendUrl(), getAuthToken().catch(() => null)]).then(([baseUrl, token]) => {
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      fetch(`${baseUrl}/export/solved-csv?timeframe=${encodeURIComponent(timeframe)}`, { headers })
         .then((res) => res.text())
         .then((data) => sendResponse({ success: true, data }))
         .catch((err) => sendResponse({ success: false, error: err.message }));

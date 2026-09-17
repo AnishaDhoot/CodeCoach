@@ -18,9 +18,11 @@ def get_utc_now() -> datetime:
 import math
 from collections import Counter
 
-from backend.database import get_db, engine, Base
+from backend.database import get_db, engine, Base, IS_SQLITE
+from backend.auth import get_current_user, get_current_user_optional
 from backend.models import (
-    Problem, Attempt, TopicMastery, UserConfig, SpacedRepetition, DailyActivity, 
+    User,
+    Problem, Attempt, TopicMastery, UserConfig, SpacedRepetition, DailyActivity,
     BadgeTest, BadgeTestStartRequest, BadgeTestProblemSchema, BadgeTestSchema, CompanyMetadata,
     SubmissionAnalyzeRequest, SubmissionAnalyzeResponse, KNOWN_PREMIUM_SLUGS,
     ProblemRecommendResponse, TopicMasterySchema,
@@ -71,6 +73,12 @@ Base.metadata.create_all(bind=engine)
 # the old mastery_score NOT NULL column is present we do the rename-recreate-
 # copy-drop dance instead.
 def _ensure_schema():
+    # The in-place column/table rewrites below are SQLite-specific DDL used to
+    # upgrade an existing local dev DB. On Postgres (hosted), Base.metadata.create_all
+    # already builds the current schema for a fresh database, and real column
+    # alterations are handled by Alembic migrations (Phase 2). So no-op off SQLite.
+    if not IS_SQLITE:
+        return
     from sqlalchemy import inspect, text
     insp = inspect(engine)
     table_names = insp.get_table_names()
@@ -253,6 +261,43 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Auth (Phase 1 foundation) — device-token identity.
+# The extension calls POST /auth/register once, stores the token, and sends it
+# as `Authorization: Bearer <token>` thereafter. Domain endpoints stay open until
+# Phase 3 scopes them to the authenticated user.
+# ---------------------------------------------------------------------------
+import secrets
+
+
+class RegisterResponse(BaseModel):
+    token: str
+    user_id: int
+
+
+@app.post("/auth/register", response_model=RegisterResponse)
+def register_device(db: Session = Depends(get_db)):
+    """Mints a new anonymous account and returns its bearer token."""
+    token = secrets.token_urlsafe(32)  # 256 bits of entropy
+    user = User(device_token=token)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return RegisterResponse(token=token, user_id=user.id)
+
+
+@app.get("/auth/me")
+def whoami(user: User = Depends(get_current_user)):
+    """Validates a token and echoes the account. Extensions use this to confirm
+    a stored token is still good before trusting it."""
+    return {
+        "user_id": user.id,
+        "email": user.email,
+        "linked": user.google_sub is not None,
+        "created_at": user.created_at,
+    }
+
 
 def _record_daily_activity(db: Session, is_success: bool):
     today = get_utc_now().strftime("%Y-%m-%d")
@@ -1351,6 +1396,10 @@ def clear_reviews(db: Session = Depends(get_db)):
     return {"deleted": deleted, "message": f"Cleared {deleted} review records."}
 
 
+# NOTE: GET /reviews/count is defined once above (near the badge/streak routes).
+# A second duplicate definition previously lived here and was unreachable; removed.
+
+
 @app.get("/topics/analysis", response_model=TopicAnalysisResponse)
 def get_topic_analysis(db: Session = Depends(get_db)):
     """Full breakdown of solved problems: difficulty + per-topic counts + weakest topics."""
@@ -1454,17 +1503,6 @@ def get_companies_metadata(db: Session = Depends(get_db)):
     """Returns a dictionary mapping company names to their focus notes."""
     meta = db.query(CompanyMetadata).all()
     return {m.name: m.focus_note for m in meta}
-
-
-@app.get("/reviews/count")
-def get_reviews_count(db: Session = Depends(get_db)):
-    """Returns count of active spaced repetition reviews due today (Tier 1.2)."""
-    now = get_utc_now()
-    due_count = db.query(SpacedRepetition).filter(
-        SpacedRepetition.next_due <= now,
-        SpacedRepetition.stage < 5
-    ).count()
-    return {"due_count": due_count}
 
 
 @app.get("/activity/streak", response_model=StreakResponse)

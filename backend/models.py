@@ -43,6 +43,26 @@ KNOWN_PREMIUM_SLUGS: Set[str] = {
 # SQLAlchemy Models
 # ==========================================
 
+class User(Base):
+    """
+    A single CodeCoach account.
+
+    Phase 1 (multi-tenant foundation): identity is a random device token minted
+    by the extension on first run and sent as `Authorization: Bearer <token>`.
+    `google_sub` / `email` are reserved for the Phase-2 Google Sign-In linking
+    that upgrades a device to a real, cross-device account. No other table
+    references this yet — per-user scoping of the domain tables lands in Phase 2/3.
+    """
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    device_token = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, nullable=True, index=True)
+    google_sub = Column(String, unique=True, index=True, nullable=True)  # Google OAuth subject (future)
+    created_at = Column(DateTime, default=get_utc_now, nullable=False)
+    last_seen = Column(DateTime, default=get_utc_now, nullable=False)
+
+
 class Problem(Base):
     __tablename__ = "problems"
 
