@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict
@@ -80,10 +80,38 @@ class Problem(Base):
     attempts = relationship("Attempt", back_populates="problem")
 
 
+class UserProblem(Base):
+    """Per-user problem state (Phase 2 expand).
+
+    `problems` becomes a shared catalog (title/url/difficulty/topics/companies/
+    is_premium); the per-user bits (solved status, notes, personal difficulty)
+    live here, one row per (user, problem). Phase 3 dual-writes and backfills
+    from the legacy Problem.is_solved/user_notes columns; the contract phase then
+    drops those columns from `problems`.
+    """
+    __tablename__ = "user_problems"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    problem_id = Column(String, ForeignKey("problems.id"), index=True, nullable=False)
+    is_solved = Column(Boolean, default=False, nullable=False)
+    solved_live = Column(Boolean, default=False, nullable=False)
+    user_notes = Column(Text, nullable=True)
+    personal_difficulty = Column(String, nullable=True)
+    created_at = Column(DateTime, default=get_utc_now, nullable=False)
+    updated_at = Column(DateTime, default=get_utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "problem_id", name="uq_user_problem"),
+    )
+
+
 class Attempt(Base):
     __tablename__ = "attempts"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    # Phase 2 (expand): nullable now; Phase 3 scopes reads/writes, contract phase makes it NOT NULL.
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     problem_id = Column(String, ForeignKey("problems.id"), nullable=False)
     timestamp = Column(DateTime, default=get_utc_now, nullable=False)
     verdict = Column(String, nullable=False) # e.g., Wrong Answer, Accepted, etc.
@@ -100,6 +128,8 @@ class TopicMastery(Base):
     __tablename__ = "topic_mastery"
 
     topic = Column(String, primary_key=True, index=True) # e.g., "Arrays", "Two Pointers"
+    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, topic).
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     rating = Column(Float, default=1200.0, nullable=False)
     attempts_count = Column(Integer, default=0, nullable=False)
     success_count = Column(Integer, default=0, nullable=False)
@@ -142,6 +172,7 @@ class BadgeTest(Base):
     __tablename__ = "badge_tests"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)  # Phase 2 (expand)
     topic = Column(String, nullable=False)
     level = Column(Integer, nullable=False) # level being tested for (1-5)
     status = Column(String, default="active") # "active", "passed", "abandoned"
@@ -159,6 +190,8 @@ class UserConfig(Base):
     __tablename__ = "user_config"
 
     key = Column(String, primary_key=True, index=True)
+    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, key).
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     value = Column(String, nullable=True)
 
 
@@ -166,6 +199,8 @@ class SpacedRepetition(Base):
     __tablename__ = "spaced_repetition"
 
     problem_id = Column(String, ForeignKey("problems.id"), primary_key=True, index=True)
+    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, problem_id).
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     stage = Column(Integer, default=1, nullable=False) # 1: 3 days, 2: 7 days, 3: 14 days, 4: complete
     last_solved = Column(DateTime, default=get_utc_now, nullable=False)
     next_due = Column(DateTime, nullable=False)
@@ -178,6 +213,8 @@ class DailyActivity(Base):
     __tablename__ = "daily_activity"
 
     date = Column(String, primary_key=True)  # ISO date string "YYYY-MM-DD"
+    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, date).
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     problems_attempted = Column(Integer, default=0, nullable=False)
     problems_solved = Column(Integer, default=0, nullable=False)
 

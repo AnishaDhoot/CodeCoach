@@ -60,8 +60,12 @@ from backend.recommender import (
 )
 from backend.seed import seed_db, SEED_DATA
 
-# Ensure tables are created (just in case)
-Base.metadata.create_all(bind=engine)
+# Schema bootstrap:
+#   * SQLite (local dev / tests): create_all builds tables directly — fast, no Alembic step.
+#   * Postgres (hosted): Alembic owns the schema (`alembic upgrade head` at deploy); we skip
+#     create_all to avoid drift between the two mechanisms.
+if IS_SQLITE:
+    Base.metadata.create_all(bind=engine)
 
 
 # --- Lightweight in-place schema migration ---------------------------------
