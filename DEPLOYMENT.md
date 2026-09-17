@@ -80,6 +80,25 @@ Two edits once you have the HTTPS URL (e.g. `https://codecoach-backend.onrender.
    ```
    (Users can still override via the stored `customBackendUrl`.) Then `npm run build`.
 
+## Chrome Web Store submission checklist
+
+- [x] **Icons** — 16/32/48/128 PNGs in `extension/public/icons/`, wired into
+  `manifest.json` (`icons` + `action.default_icon`). Rebuild (`npm run build`) so
+  they land in `dist/`.
+- [ ] **Privacy policy URL** — required (the extension reads LeetCode history and
+  sends code to a third-party LLM). Fill the `<CONTACT_EMAIL>` / `<BACKEND_URL>`
+  placeholders in [PRIVACY_POLICY.md](PRIVACY_POLICY.md), then host it and paste the
+  URL into the listing. Easiest: enable GitHub Pages, or use the rendered file URL
+  `https://github.com/AnishaDhoot/CodeCoach/blob/main/PRIVACY_POLICY.md`.
+- [ ] **Production `host_permissions`** — replace `http://localhost:8000/*` with your
+  deployed HTTPS backend (see "Point the extension at the deployed backend" above).
+- [ ] **Data-use disclosure** — in the Store dashboard's Privacy tab, declare that the
+  extension handles "Website content" (user's code) and sends it to an AI service.
+- [ ] **Screenshots + listing copy** — 1–5 screenshots (1280×800 or 640×400) of the
+  overlay in action, a short + detailed description, and a category (Developer Tools).
+- [ ] **Package** — zip the contents of `extension/dist/` (not the folder itself) and
+  upload; or upload the unpacked `dist/` via the dashboard.
+
 ## Scaling notes
 
 - **DB pooling** is on (`pool_pre_ping`, size 5 + overflow 10 per worker). On small
