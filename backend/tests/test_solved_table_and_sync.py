@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from backend.main import app
 from backend.database import Base, engine, get_db, SessionLocal
 from backend.models import Problem, Attempt, TopicMastery, SpacedRepetition, UserConfig, BadgeTest
+from backend.tests._auth import auth_headers
 from datetime import datetime, timezone, timedelta
 
 client = TestClient(app)
@@ -87,7 +88,7 @@ def test_solved_problems_table_endpoint():
         "problem_id": "container-with-most-water",
         "user_notes": "Shrink window from shorter side.",
         "personal_difficulty": "Medium"
-    })
+    }, headers=auth_headers(client))
     assert note_res.status_code == 200
 
     # Query solved table

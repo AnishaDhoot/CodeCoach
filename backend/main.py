@@ -20,6 +20,7 @@ from collections import Counter
 
 from backend.database import get_db, engine, Base, IS_SQLITE
 from backend.auth import get_current_user, get_current_user_optional
+from backend.user_problems import get_or_create_problem, get_user_problem, get_or_create_user_problem
 from backend.models import (
     User,
     Problem, Attempt, TopicMastery, UserConfig, SpacedRepetition, DailyActivity,
@@ -1781,49 +1782,64 @@ def get_weekly_journal(db: Session = Depends(get_db)):
 
 
 @app.get("/problems/{problem_id}")
-def get_problem_details(problem_id: str, db: Session = Depends(get_db)):
-    """Fetches metadata, user notes, and personal difficulty rating for a problem."""
+def get_problem_details(problem_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Fetches shared catalog metadata plus THIS user's notes / personal difficulty.
+
+    Phase 3 (scoped): per-user notes come from `user_problems`, falling back to the
+    legacy `problems` columns for rows not yet migrated (dual-read).
+    """
     problem = db.query(Problem).filter(Problem.id == problem_id).first()
+    up = get_user_problem(db, user.id, problem_id)
+
+    # Read per-user state ONLY from the user's own row. We deliberately do NOT fall
+    # back to problems.user_notes: that column is shared/global and would leak other
+    # users' notes. Pre-migration legacy notes are backfilled to a legacy user in the
+    # full Phase 3 pass, then read here like any other per-user row.
+    user_notes = (up.user_notes if up else "") or ""
+    personal_difficulty = (up.personal_difficulty if up else "") or ""
+
     if not problem:
-        return {"problem_id": problem_id, "user_notes": "", "personal_difficulty": ""}
+        return {
+            "problem_id": problem_id,
+            "user_notes": user_notes,
+            "personal_difficulty": personal_difficulty,
+        }
+
     return {
         "problem_id": problem.id,
         "title": problem.title,
         "difficulty": problem.difficulty,
         "topics": problem.topics,
         "companies": problem.companies,
-        "user_notes": problem.user_notes or "",
-        "personal_difficulty": problem.personal_difficulty or ""
+        "user_notes": user_notes,
+        "personal_difficulty": personal_difficulty,
     }
 
 
 @app.post("/problems/{problem_id}/notes")
-def save_problem_notes(problem_id: str, req: dict, db: Session = Depends(get_db)):
-    """Saves custom user notes and personal difficulty rating for a problem."""
-    problem = db.query(Problem).filter(Problem.id == problem_id).first()
-    if not problem:
-        problem = Problem(
-            id=problem_id,
-            title=req.get("problem_title", problem_id),
-            url=f"https://leetcode.com/problems/{problem_id}/",
-            difficulty="Medium",
-            topics="Arrays & Hashing"
-        )
-        db.add(problem)
-        db.commit()
-        db.refresh(problem)
+def save_problem_notes(problem_id: str, req: dict, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Saves THIS user's notes / personal difficulty for a problem.
+
+    Phase 3 (scoped): writes to the per-user `user_problems` row. During the
+    expand/contract transition it also dual-writes the legacy `problems` columns
+    so endpoints not yet migrated (e.g. /problems/solved) stay consistent.
+    """
+    problem = get_or_create_problem(db, problem_id, title=req.get("problem_title", problem_id))
+    up = get_or_create_user_problem(db, user.id, problem_id)
 
     if "user_notes" in req:
-        problem.user_notes = req["user_notes"]
+        up.user_notes = req["user_notes"]
+        problem.user_notes = req["user_notes"]          # legacy dual-write (transitional)
     if "personal_difficulty" in req:
-        problem.personal_difficulty = req["personal_difficulty"]
+        up.personal_difficulty = req["personal_difficulty"]
+        problem.personal_difficulty = req["personal_difficulty"]  # legacy dual-write (transitional)
 
     db.commit()
     return {
         "status": "success",
         "problem_id": problem.id,
-        "user_notes": problem.user_notes,
-        "personal_difficulty": problem.personal_difficulty
+        "user_notes": up.user_notes,
+        "personal_difficulty": up.personal_difficulty,
     }
 
 

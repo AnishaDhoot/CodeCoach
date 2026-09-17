@@ -4,6 +4,7 @@ from starlette.testclient import TestClient
 from backend.main import app, check_and_increment_ai_quota, AI_DAILY_QUOTA_LIMIT, get_utc_now
 from backend.database import Base, engine, SessionLocal
 from backend.models import UserConfig, BadgeTest, Problem
+from backend.tests._auth import auth_headers
 
 client = TestClient(app)
 
@@ -73,16 +74,17 @@ def test_fairplay_lock_blocks_hints_during_active_badge_test(setup_db):
 def test_security_sql_injection_defense():
     """Verifies SQL injection attempts in problem paths and filters are safely parameterized without crashing."""
     malicious_slug = "two-sum' OR '1'='1"
-    res = client.get(f"/problems/{malicious_slug}")
+    res = client.get(f"/problems/{malicious_slug}", headers=auth_headers(client))
     assert res.status_code == 200
     assert res.json()["problem_id"] == malicious_slug
 
 def test_security_xss_in_notes_sanitization(setup_db):
     """Verifies storing and retrieving HTML/script payloads in notes does not cause server corruption."""
     xss_note = "<script>alert('XSS')</script><b>Valid note</b>"
-    res = client.post("/problems/two-sum/notes", json={"user_notes": xss_note})
+    headers = auth_headers(client)
+    res = client.post("/problems/two-sum/notes", json={"user_notes": xss_note}, headers=headers)
     assert res.status_code == 200
-    
-    get_res = client.get("/problems/two-sum")
+
+    get_res = client.get("/problems/two-sum", headers=headers)
     assert get_res.status_code == 200
     assert get_res.json()["user_notes"] == xss_note
