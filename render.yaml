@@ -23,6 +23,10 @@ services:
         sync: false
       - key: RUN_MIGRATIONS      # entrypoint runs `alembic upgrade head` on boot (single free instance)
         value: "1"
+      - key: SEED_ON_START       # seed the problem catalog on boot (idempotent, non-destructive)
+        value: "1"
+      - key: SEED_SKIP_GITHUB    # skip per-company GitHub fetch at boot (fast, network-free)
+        value: "1"
       - key: WEB_CONCURRENCY     # 1 worker fits the free plan's memory
         value: "1"
       - key: AI_DAILY_QUOTA_LIMIT

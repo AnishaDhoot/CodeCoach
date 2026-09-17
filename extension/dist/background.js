@@ -2,7 +2,7 @@
 // Handles API calls to the local FastAPI backend to bypass CORS and extension constraints,
 // and fetches the user's LeetCode solved-problem history via scripting injection.
 
-let DEFAULT_BACKEND_URL = "http://localhost:8000";
+let DEFAULT_BACKEND_URL = "https://codecoach-backend-hja6.onrender.com";
 
 async function getBackendUrl() {
   try {
@@ -83,7 +83,7 @@ async function backendFetch(path, { method = "GET", body } = {}) {
       if (errData && errData.detail) {
         errorDetail = typeof errData.detail === "string" ? errData.detail : JSON.stringify(errData.detail);
       }
-    } catch (e) {}
+    } catch (e) { }
 
     if (res.status === 429) {
       throw new Error(errorDetail || "Limit Exceeded: Daily AI request limit reached. Please try again tomorrow.");
@@ -178,16 +178,24 @@ async function fetchSolvedProblemsViaTab() {
         console.warn("[DSA Tutor] Submission timestamp fetch notice:", e);
       }
 
-      // ── Step 2: Fetch topic tags via instant bulk GraphQL ────────────────────
+      // ── Step 2: Fetch topic tags via bulk GraphQL ────────────────────────────
+      // `allQuestions` returns tags for EVERY LeetCode problem — a large, slow
+      // payload. Bound it with a timeout so a slow response doesn't hang the whole
+      // sync; on timeout we fall back to per-solved-slug batches below (bounded by
+      // the user's own solved count).
       const topicMap = new Map();
       try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
         const bulkRes = await fetch("https://leetcode.com/graphql/", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             query: `query { allQuestions { titleSlug topicTags { name } } }`
-          })
+          }),
+          signal: ctrl.signal
         });
+        clearTimeout(timer);
         if (bulkRes.ok) {
           const bulkData = await bulkRes.json();
           const qList = bulkData?.data?.allQuestions || [];
@@ -198,7 +206,7 @@ async function fetchSolvedProblemsViaTab() {
           }
         }
       } catch (e) {
-        console.warn("[DSA Tutor] Bulk topic fetch failed:", e);
+        console.warn("[DSA Tutor] Bulk topic fetch skipped/timed out; using per-slug fallback:", e);
       }
 
       const CANONICAL_TOPIC_MAP = {

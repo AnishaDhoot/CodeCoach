@@ -1049,6 +1049,15 @@ def sync_solved(req: SyncSolvedRequest, user: User = Depends(get_current_user), 
         ).all()
     } if prob_ids else set()
 
+    # Prefetch this user's problem rows so we can mark solved without a
+    # per-problem SELECT+flush (critical over a remote DB).
+    from backend.models import UserProblem
+    existing_ups = {
+        up.problem_id: up for up in db.query(UserProblem).filter(
+            UserProblem.user_id == user.id, UserProblem.problem_id.in_(prob_ids)
+        ).all()
+    } if prob_ids else {}
+
     now_utc = get_utc_now()
 
     # 1. Upsert each problem (mark solved) and collect per-topic solved counts.
@@ -1110,8 +1119,14 @@ def sync_solved(req: SyncSolvedRequest, user: User = Depends(get_current_user), 
             db.add(problem)
             existing_problems[prob.problem_id] = problem
 
-        # Per-user solved state.
-        mark_solved(db, user.id, prob.problem_id)
+        # Per-user solved state (upsert without per-item flush).
+        up = existing_ups.get(prob.problem_id)
+        if up:
+            up.is_solved = True
+        else:
+            up = UserProblem(user_id=user.id, problem_id=prob.problem_id, is_solved=True)
+            db.add(up)
+            existing_ups[prob.problem_id] = up
 
         # Record accepted attempt with actual solve timestamp if not already present
         if prob.problem_id not in existing_attempts:

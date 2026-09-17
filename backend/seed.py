@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 import urllib.request
 from backend.database import SessionLocal, engine, Base
 from backend.models import Problem, TopicMastery, Attempt, SpacedRepetition, DailyActivity, BadgeTest, CompanyMetadata
@@ -2682,20 +2683,22 @@ def parse_company_csv(csv_data):
         })
     return questions
 
-def seed_db():
-    print("Clearing tables for fresh re-seed...")
+def seed_db(skip_github: bool = False):
+    """Seed the shared problem catalog + company metadata (idempotent, non-destructive).
+
+    Only inserts catalog rows that are missing — it never deletes user data
+    (attempts, mastery, etc.) or existing catalog rows, so it is safe to run on
+    every deploy. Pass skip_github=True (or set SEED_SKIP_GITHUB=1) to skip the
+    per-company GitHub CSV fetch and use the bundled fallback lists — much faster
+    and network-free, which matters at container boot.
+    """
+    if os.getenv("SEED_SKIP_GITHUB", "").lower() in ("1", "true", "yes"):
+        skip_github = True
+    print(f"Seeding catalog (skip_github={skip_github})...")
     db = SessionLocal()
     try:
-        # Delete dependent tables first to avoid FK constraints
-        db.query(SpacedRepetition).delete()
-        db.query(Attempt).delete()
-        db.query(BadgeTest).delete()
-        db.query(TopicMastery).delete()
-        db.query(DailyActivity).delete()
-        db.query(CompanyMetadata).delete()
-        db.query(Problem).delete()
-        db.commit()
-        print("Existing data cleaned successfully!")
+        existing_problem_ids = {pid for (pid,) in db.query(Problem.id).all()}
+        existing_company_names = {name for (name,) in db.query(CompanyMetadata.name).all()}
 
         # 1. Parse base problems from the 14-topic JSON data structure
         problems_dict = {}
@@ -2744,13 +2747,14 @@ def seed_db():
             comp_name = comp["name"]
             focus_note = comp.get("focus_note")
             
-            # Save focus note metadata
-            meta = CompanyMetadata(name=comp_name, focus_note=focus_note)
-            db.add(meta)
+            # Save focus note metadata (only if not already present)
+            if comp_name not in existing_company_names:
+                db.add(CompanyMetadata(name=comp_name, focus_note=focus_note))
+                existing_company_names.add(comp_name)
 
-            # Try to fetch additional questions from GitHub repo
+            # Try to fetch additional questions from GitHub repo (unless skipping network)
             slug = get_company_slug(comp_name)
-            csv_data = fetch_company_csv_from_github(slug)
+            csv_data = None if skip_github else fetch_company_csv_from_github(slug)
             questions_to_load = []
 
             if csv_data:
@@ -2826,9 +2830,11 @@ def seed_db():
                         "is_premium": q_data.get('is_premium', False)
                     }
 
-        # Seed Problems
-        print("Inserting problems into database...")
+        # Seed Problems (insert only those missing from the catalog)
+        inserted = 0
         for p_id, p_data in problems_dict.items():
+            if p_id in existing_problem_ids:
+                continue
             prob = Problem(
                 id=p_id,
                 title=p_data["title"],
@@ -2839,6 +2845,8 @@ def seed_db():
                 is_premium=p_data.get("is_premium", False)
             )
             db.add(prob)
+            inserted += 1
+        print(f"Inserting {inserted} new problems into catalog...")
 
         # NOTE: TopicMastery is per-user now (multi-tenant). It is created on
         # demand per user (e.g. GET /topics/mastery seeds the 14 standard topics

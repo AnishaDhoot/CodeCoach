@@ -21,7 +21,7 @@
   },
   "host_permissions": [
     "https://leetcode.com/*",
-    "http://localhost:8000/*"
+    "https://codecoach-backend-hja6.onrender.com/*"
   ],
   "content_scripts": [
     {
