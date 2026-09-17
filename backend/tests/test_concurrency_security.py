@@ -5,6 +5,7 @@ from backend.main import app, check_and_increment_ai_quota, AI_DAILY_QUOTA_LIMIT
 from backend.database import Base, engine, SessionLocal
 from backend.models import UserConfig, BadgeTest, Problem
 from backend.tests._auth import auth_headers
+from backend.conftest import ensure_test_user
 
 client = TestClient(app)
 
@@ -13,9 +14,10 @@ def setup_db():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
+    uid = ensure_test_user(db).id
     today_str = get_utc_now().strftime("%Y-%m-%d")
-    # Reset quota to 0
-    db.add(UserConfig(key=f"ai_limit_{today_str}", value="0"))
+    # Reset quota to 0 for the test user
+    db.add(UserConfig(user_id=uid, key=f"ai_limit_{today_str}", value="0"))
     db.add(Problem(id="two-sum", title="Two Sum", url="https://leetcode.com/problems/two-sum", difficulty="Easy", topics="Arrays & Hashing", is_premium=False))
     db.commit()
     yield db
@@ -24,12 +26,13 @@ def setup_db():
 def test_atomic_quota_increment_under_concurrency(setup_db):
     """Simulates concurrent threads incrementing the AI quota atomically."""
     errors = []
-    
+    uid = ensure_test_user(setup_db).id
+
     def worker():
         local_db = SessionLocal()
         try:
             for _ in range(3):
-                check_and_increment_ai_quota(local_db)
+                check_and_increment_ai_quota(local_db, uid)
         except Exception as e:
             errors.append(e)
         finally:
@@ -42,7 +45,9 @@ def test_atomic_quota_increment_under_concurrency(setup_db):
         t.join()
 
     today_str = get_utc_now().strftime("%Y-%m-%d")
-    config = setup_db.query(UserConfig).filter(UserConfig.key == f"ai_limit_{today_str}").first()
+    config = setup_db.query(UserConfig).filter(
+        UserConfig.user_id == uid, UserConfig.key == f"ai_limit_{today_str}"
+    ).first()
     assert config is not None
     # 5 threads * 3 increments = 15 total used
     assert int(config.value) == 15

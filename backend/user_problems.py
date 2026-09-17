@@ -44,3 +44,30 @@ def get_or_create_user_problem(db: Session, user_id: int, problem_id: str) -> Us
         db.flush()
     up.updated_at = get_utc_now()
     return up
+
+
+def mark_solved(db: Session, user_id: int, problem_id: str, *, live: bool = False) -> UserProblem:
+    """Mark a problem solved for this user (per-user replacement for Problem.is_solved)."""
+    up = get_or_create_user_problem(db, user_id, problem_id)
+    up.is_solved = True
+    if live:
+        up.solved_live = True
+    return up
+
+
+def solved_problem_ids(db: Session, user_id: int) -> set:
+    """Set of problem ids this user has solved."""
+    rows = db.query(UserProblem.problem_id).filter(
+        UserProblem.user_id == user_id, UserProblem.is_solved == True  # noqa: E712
+    ).all()
+    return {r[0] for r in rows}
+
+
+def solved_problems_for_user(db: Session, user_id: int):
+    """(Problem, UserProblem) pairs for every problem this user has solved."""
+    return (
+        db.query(Problem, UserProblem)
+        .join(UserProblem, UserProblem.problem_id == Problem.id)
+        .filter(UserProblem.user_id == user_id, UserProblem.is_solved == True)  # noqa: E712
+        .all()
+    )

@@ -13,7 +13,9 @@ def setup_db():
     db.query(BadgeTest).delete()
     db.query(Attempt).delete()
     db.query(UserConfig).delete()
-    
+    db.query(SpacedRepetition).delete()
+    db.query(TopicMastery).delete()
+
     # Seed problems with specific topics and companies
     p1 = Problem(id="two-sum", title="Two Sum", url="https://leetcode.com/problems/two-sum", difficulty="Easy", topics="Arrays", companies="Cisco,Google", is_premium=False)
     p2 = Problem(id="course-schedule", title="Course Schedule", url="https://leetcode.com/problems/course-schedule", difficulty="Medium", topics="Graphs", companies="Cisco,Meta", is_premium=False)

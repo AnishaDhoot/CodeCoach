@@ -2,6 +2,7 @@ import pytest
 from datetime import timedelta
 from backend.database import SessionLocal
 from backend.models import Problem, Attempt, TopicMastery, SpacedRepetition, UserConfig, BadgeTest
+from backend.conftest import ensure_test_user
 from backend.recommender import (
     get_next_problem,
     update_mastery_on_submission,
@@ -17,6 +18,8 @@ def clean_db():
     db.query(Attempt).delete()
     db.query(UserConfig).delete()
     db.query(SpacedRepetition).delete()
+    db.query(TopicMastery).delete()
+    uid = ensure_test_user(db).id
     
     # Seed test problems
     p1 = Problem(id="two-sum", title="Two Sum", url="https://leetcode.com/problems/two-sum", difficulty="Easy", topics="Arrays & Hashing", is_premium=False)
@@ -34,9 +37,9 @@ def clean_db():
     db.merge(p6)
     
     # Seed topic masteries
-    tm1 = TopicMastery(topic="Arrays & Hashing", level=1, rating=1040.0, attempts_count=5, success_count=4)
-    tm2 = TopicMastery(topic="Two Pointers", level=0, rating=800.0, attempts_count=2, success_count=0)
-    tm3 = TopicMastery(topic="Dynamic Programming", level=0, rating=800.0, attempts_count=1, success_count=0)
+    tm1 = TopicMastery(user_id=uid, topic="Arrays & Hashing", level=1, rating=1040.0, attempts_count=5, success_count=4)
+    tm2 = TopicMastery(user_id=uid, topic="Two Pointers", level=0, rating=800.0, attempts_count=2, success_count=0)
+    tm3 = TopicMastery(user_id=uid, topic="Dynamic Programming", level=0, rating=800.0, attempts_count=1, success_count=0)
     db.merge(tm1)
     db.merge(tm2)
     db.merge(tm3)
@@ -47,7 +50,8 @@ def clean_db():
 
 def test_recommendation_enforces_topic_diversity(clean_db):
     """Verifies that the 3 problem recommendations come from distinct topics."""
-    res = get_next_problem(clean_db)
+    uid = ensure_test_user(clean_db).id
+    res = get_next_problem(clean_db, uid)
     recs = res["recommendations"]
     
     assert len(recs) == 3
@@ -63,7 +67,8 @@ def test_streak_ramping_upgrades_difficulty_after_2_wins(clean_db):
     clean_db.add(Attempt(problem_id="two-sum", verdict="Accepted", timestamp=now - timedelta(minutes=2)))
     clean_db.commit()
     
-    res = get_next_problem(clean_db, focus_topic="Arrays & Hashing")
+    uid = ensure_test_user(clean_db).id
+    res = get_next_problem(clean_db, uid, focus_topic="Arrays & Hashing")
     focus_rec = next((r for r in res["recommendations"] if "Arrays & Hashing" in r["topics"]), None)
     
     assert focus_rec is not None
@@ -72,20 +77,21 @@ def test_streak_ramping_upgrades_difficulty_after_2_wins(clean_db):
 
 def test_spaced_repetition_5_stage_progression(clean_db):
     """Verifies spaced repetition stage transitions from 1 -> 2 -> 3 -> 4 -> 5."""
-    sr = update_spaced_repetition(clean_db, "two-sum")
+    uid = ensure_test_user(clean_db).id
+    sr = update_spaced_repetition(clean_db, uid, "two-sum")
     assert sr.stage == 1
     assert sr.next_due > get_utc_now()
     
-    sr2 = update_spaced_repetition(clean_db, "two-sum")
+    sr2 = update_spaced_repetition(clean_db, uid, "two-sum")
     assert sr2.stage == 2
     
-    sr3 = update_spaced_repetition(clean_db, "two-sum")
+    sr3 = update_spaced_repetition(clean_db, uid, "two-sum")
     assert sr3.stage == 3
     
-    sr4 = update_spaced_repetition(clean_db, "two-sum")
+    sr4 = update_spaced_repetition(clean_db, uid, "two-sum")
     assert sr4.stage == 4
     
-    sr5 = update_spaced_repetition(clean_db, "two-sum")
+    sr5 = update_spaced_repetition(clean_db, uid, "two-sum")
     assert sr5.stage == 5
 
 def test_topic_tag_isolation_filter():

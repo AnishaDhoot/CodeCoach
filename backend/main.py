@@ -20,7 +20,10 @@ from collections import Counter
 
 from backend.database import get_db, engine, Base, IS_SQLITE
 from backend.auth import get_current_user, get_current_user_optional
-from backend.user_problems import get_or_create_problem, get_user_problem, get_or_create_user_problem
+from backend.user_problems import (
+    get_or_create_problem, get_user_problem, get_or_create_user_problem,
+    mark_solved, solved_problem_ids, solved_problems_for_user,
+)
 from backend.models import (
     User,
     Problem, Attempt, TopicMastery, UserConfig, SpacedRepetition, DailyActivity,
@@ -69,161 +72,9 @@ if IS_SQLITE:
     Base.metadata.create_all(bind=engine)
 
 
-# --- Lightweight in-place schema migration ---------------------------------
-# Handles two generations of the topic_mastery schema:
-#   Old: mastery_score, success_rate, last_attempted, next_due_date  (flat score)
-#   New: rating, success_count, last_updated, next_review_date       (Elo)
-#
-# SQLite doesn't support ALTER COLUMN / DROP COLUMN with constraints, so when
-# the old mastery_score NOT NULL column is present we do the rename-recreate-
-# copy-drop dance instead.
-def _ensure_schema():
-    # The in-place column/table rewrites below are SQLite-specific DDL used to
-    # upgrade an existing local dev DB. On Postgres (hosted), Base.metadata.create_all
-    # already builds the current schema for a fresh database, and real column
-    # alterations are handled by Alembic migrations (Phase 2). So no-op off SQLite.
-    if not IS_SQLITE:
-        return
-    from sqlalchemy import inspect, text
-    insp = inspect(engine)
-    table_names = insp.get_table_names()
-
-    # -- problems columns --
-    if "problems" in table_names:
-        prob_cols = [c["name"] for c in insp.get_columns("problems")]
-        if "is_solved" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN is_solved BOOLEAN DEFAULT 0 NOT NULL"))
-        if "companies" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN companies TEXT"))
-        if "user_notes" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN user_notes TEXT"))
-        if "personal_difficulty" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN personal_difficulty TEXT"))
-        if "solved_live" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN solved_live BOOLEAN DEFAULT 0 NOT NULL"))
-
-    # -- attempts columns --
-    if "attempts" in table_names:
-        att_cols = [c["name"] for c in insp.get_columns("attempts")]
-        if "time_spent_seconds" not in att_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE attempts ADD COLUMN time_spent_seconds INTEGER"))
-
-    # -- topic_mastery Elo migration --
-    if "topic_mastery" in table_names:
-        tm_cols = {c["name"] for c in insp.get_columns("topic_mastery")}
-        if "level" not in tm_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE topic_mastery ADD COLUMN level INTEGER DEFAULT 0 NOT NULL"))
-
-        if "mastery_score" in tm_cols:
-            # Old flat-score schema → Elo schema via table reconstruction.
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE topic_mastery RENAME TO _topic_mastery_old"))
-                conn.execute(text("""
-                    CREATE TABLE topic_mastery (
-                        topic            TEXT     PRIMARY KEY NOT NULL,
-                        rating           REAL     NOT NULL DEFAULT 1200.0,
-                        attempts_count   INTEGER  NOT NULL DEFAULT 0,
-                        success_count    INTEGER  NOT NULL DEFAULT 0,
-                        level            INTEGER  NOT NULL DEFAULT 0,
-                        last_updated     DATETIME,
-                        next_review_date DATETIME
-                    )
-                """))
-                conn.execute(text("""
-                    INSERT INTO topic_mastery
-                        (topic, rating, attempts_count, success_count, level,
-                         last_updated, next_review_date)
-                    SELECT
-                        topic,
-                        CASE
-                            WHEN rating IS NOT NULL AND rating != 1200.0
-                            THEN rating
-                            ELSE COALESCE(mastery_score, 0.0) * 1200.0 + 800.0
-                        END,
-                        COALESCE(attempts_count, 0),
-                        COALESCE(
-                            success_count,
-                            CAST(COALESCE(attempts_count,0)*COALESCE(success_rate,0.0) AS INTEGER)
-                        ),
-                        0,
-                        COALESCE(last_updated, last_attempted, DATETIME('now')),
-                        COALESCE(next_review_date, next_due_date)
-                    FROM _topic_mastery_old
-                """))
-                conn.execute(text("DROP TABLE _topic_mastery_old"))
-
-        elif "rating" not in tm_cols:
-            # Fresh install lacking all Elo columns — add them individually.
-            elo_additions = [
-                ("rating",           "ALTER TABLE topic_mastery ADD COLUMN rating REAL DEFAULT 1200.0 NOT NULL"),
-                ("success_count",    "ALTER TABLE topic_mastery ADD COLUMN success_count INTEGER DEFAULT 0 NOT NULL"),
-                ("level",            "ALTER TABLE topic_mastery ADD COLUMN level INTEGER DEFAULT 0 NOT NULL"),
-                ("last_updated",     "ALTER TABLE topic_mastery ADD COLUMN last_updated DATETIME"),
-                ("next_review_date", "ALTER TABLE topic_mastery ADD COLUMN next_review_date DATETIME"),
-            ]
-            for col_name, ddl in elo_additions:
-                if col_name not in tm_cols:
-                    with engine.begin() as conn:
-                        conn.execute(text(ddl))
-
-    # -- problems columns --
-    if "problems" in table_names:
-        prob_cols = [c["name"] for c in insp.get_columns("problems")]
-        if "is_premium" not in prob_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE problems ADD COLUMN is_premium BOOLEAN DEFAULT 0 NOT NULL"))
-
-
-    # -- badge_tests columns --
-    if "badge_tests" in table_names:
-        bt_cols = [c["name"] for c in insp.get_columns("badge_tests")]
-        if "time_limit_seconds" not in bt_cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE badge_tests ADD COLUMN time_limit_seconds INTEGER DEFAULT 5400 NOT NULL"))
-
-    # -- Sync premium status for all known premium problem slugs --
-    if "problems" in table_names and KNOWN_PREMIUM_SLUGS:
-        with engine.begin() as conn:
-            slugs_str = ",".join([f"'{s}'" for s in KNOWN_PREMIUM_SLUGS])
-            conn.execute(text(f"UPDATE problems SET is_premium = 1 WHERE id IN ({slugs_str})"))
-
-    # Check if database is empty and warn developer
-    from backend.database import SessionLocal
-    db_conn = SessionLocal()
-    try:
-        if db_conn.query(Problem).count() == 0:
-            print("[Warning] Problems table is empty! Please run 'python backend/seed.py' to seed the database.")
-        
-        # Smoothly redistribute clumped Stage 1 reviews if a massive batch shares the exact same timestamp
-        sr_count = db_conn.query(SpacedRepetition).count()
-        if sr_count > 20:
-            clumped = db_conn.query(SpacedRepetition).filter(SpacedRepetition.stage == 1).all()
-            # If > 50 stage 1 items are identical/overdue from initial batch import, stagger them
-            if len(clumped) > 50:
-                now_val = get_utc_now()
-                # Check if > 50 items share identical minute
-                time_groups = Counter([str(sr.next_due)[:16] for sr in clumped])
-                most_common_count = time_groups.most_common(1)[0][1] if time_groups else 0
-                if most_common_count > 50:
-                    for i, sr in enumerate(clumped):
-                        stagger_offset = 1 + (abs(hash(sr.problem_id or str(i))) % 14)
-                        sr.next_due = now_val + timedelta(days=stagger_offset)
-                    db_conn.commit()
-    except Exception as e:
-        print(f"Database check warning: {e}")
-    finally:
-        db_conn.close()
-
-
-_ensure_schema()
-
+# Schema is owned by create_all (SQLite dev/tests) and Alembic (Postgres). The
+# legacy in-place _ensure_schema() migration for old single-tenant DBs was removed
+# in Phase 3 when the schema was squashed to the multi-tenant model.
 
 # Focus-topic key used inside the UserConfig key/value store.
 FOCUS_KEY = "focus_topic"
@@ -312,11 +163,13 @@ def whoami(user: User = Depends(get_current_user)):
     }
 
 
-def _record_daily_activity(db: Session, is_success: bool):
+def _record_daily_activity(db: Session, user_id: int, is_success: bool):
     today = get_utc_now().strftime("%Y-%m-%d")
-    act = db.query(DailyActivity).filter(DailyActivity.date == today).first()
+    act = db.query(DailyActivity).filter(
+        DailyActivity.user_id == user_id, DailyActivity.date == today
+    ).first()
     if not act:
-        act = DailyActivity(date=today, problems_attempted=1, problems_solved=1 if is_success else 0)
+        act = DailyActivity(user_id=user_id, date=today, problems_attempted=1, problems_solved=1 if is_success else 0)
         db.add(act)
     else:
         act.problems_attempted += 1
@@ -324,15 +177,17 @@ def _record_daily_activity(db: Session, is_success: bool):
             act.problems_solved += 1
 
 
-def check_active_test_lock(db: Session, is_contest: bool = False):
+def check_active_test_lock(db: Session, user_id: int, is_contest: bool = False):
     if is_contest:
         raise HTTPException(
             status_code=403,
             detail="AI features and hints are strictly disabled during LeetCode contests to ensure fair play."
         )
 
-    # 1. Check Badge Test lock
-    active = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
+    # Badge Test lock — scoped to this user's own active test.
+    active = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user_id, BadgeTest.status == "active"
+    ).first()
     if active:
         raise HTTPException(
             status_code=403,
@@ -340,37 +195,43 @@ def check_active_test_lock(db: Session, is_contest: bool = False):
         )
 
 
-def check_and_increment_ai_quota(db: Session, increment: bool = True):
+def check_and_increment_ai_quota(db: Session, user_id: int, increment: bool = True):
+    """Per-user daily AI quota. Atomic under concurrency via UPDATE ... RETURNING."""
     from sqlalchemy import text
     today_str = get_utc_now().strftime("%Y-%m-%d")
     key = f"ai_limit_{today_str}"
-    
-    # 1. Ensure the row exists for today (insert 0 if ignore)
-    db.execute(
-        text("INSERT OR IGNORE INTO user_config (key, value) VALUES (:key, '0')"),
-        {"key": key}
-    )
+
+    # 1. Ensure today's row exists for this user (portable upsert-ignore).
+    if IS_SQLITE:
+        db.execute(
+            text("INSERT OR IGNORE INTO user_config (user_id, key, value) VALUES (:uid, :key, '0')"),
+            {"uid": user_id, "key": key},
+        )
+    else:
+        db.execute(
+            text("INSERT INTO user_config (user_id, key, value) VALUES (:uid, :key, '0') "
+                 "ON CONFLICT (user_id, key) DO NOTHING"),
+            {"uid": user_id, "key": key},
+        )
     db.commit()
-    
+
     if increment:
-        # Atomic update and fetch new value
         res = db.execute(
             text(
                 "UPDATE user_config "
                 "SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
-                "WHERE key = :key AND CAST(value AS INTEGER) < :limit "
+                "WHERE user_id = :uid AND key = :key AND CAST(value AS INTEGER) < :limit "
                 "RETURNING value"
             ),
-            {"key": key, "limit": AI_DAILY_QUOTA_LIMIT}
+            {"uid": user_id, "key": key, "limit": AI_DAILY_QUOTA_LIMIT},
         )
         row = res.fetchone()
         db.commit()
-        
+
         if not row:
-            # If no row returned, it means value >= limit
             current_val_res = db.execute(
-                text("SELECT value FROM user_config WHERE key = :key"),
-                {"key": key}
+                text("SELECT value FROM user_config WHERE user_id = :uid AND key = :key"),
+                {"uid": user_id, "key": key},
             )
             val_row = current_val_res.fetchone()
             used = int(val_row[0]) if val_row else AI_DAILY_QUOTA_LIMIT
@@ -379,10 +240,9 @@ def check_and_increment_ai_quota(db: Session, increment: bool = True):
                 detail=f"Daily AI request limit reached ({used}/{AI_DAILY_QUOTA_LIMIT}). Please try again tomorrow to avoid excessive API costs."
             )
     else:
-        # Just check current value
         res = db.execute(
-            text("SELECT value FROM user_config WHERE key = :key"),
-            {"key": key}
+            text("SELECT value FROM user_config WHERE user_id = :uid AND key = :key"),
+            {"uid": user_id, "key": key},
         )
         row = res.fetchone()
         used = int(row[0]) if row else 0
@@ -394,11 +254,13 @@ def check_and_increment_ai_quota(db: Session, increment: bool = True):
 
 
 @app.get("/ai/quota")
-def get_ai_quota(db: Session = Depends(get_db)):
-    """Returns the daily AI quota usage and limit."""
+def get_ai_quota(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's daily AI quota usage and limit."""
     today_str = get_utc_now().strftime("%Y-%m-%d")
     key = f"ai_limit_{today_str}"
-    config = db.query(UserConfig).filter(UserConfig.key == key).first()
+    config = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == key
+    ).first()
     used = 0
     if config:
         try:
@@ -409,37 +271,30 @@ def get_ai_quota(db: Session = Depends(get_db)):
 
 
 @app.post("/submissions/analyze", response_model=SubmissionAnalyzeResponse)
-def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_db)):
+def analyze_submission(req: SubmissionAnalyzeRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Analyzes a failed submission or registers a successful one.
+    Analyzes a failed submission or registers a successful one (for this user).
     Triggers LLM diagnosis for failures and updates mastery tracking.
     """
-    # 1. Fetch or dynamically create the problem in the DB
-    problem = db.query(Problem).filter(Problem.id == req.problem_id).first()
-    if not problem:
-        # Dynamically register the problem if not seeded
-        problem = Problem(
-            id=req.problem_id,
-            title=req.problem_title,
-            url=f"https://leetcode.com/problems/{req.problem_id}/",
-            difficulty="Medium", # Default
-            topics="Arrays & Hashing" # Fallback topic
-        )
-        db.add(problem)
-        db.commit()
-        db.refresh(problem)
+    # 1. Fetch or dynamically create the problem in the shared catalog
+    problem = get_or_create_problem(
+        db, req.problem_id, title=req.problem_title, difficulty="Medium", topics="Arrays & Hashing"
+    )
+    db.commit()
+    db.refresh(problem)
 
     is_success = (req.verdict.lower() in ["accepted", "success"])
 
-    # If successful, set is_solved and solved_live in problem
+    # If successful, mark solved for THIS user.
     if is_success:
-        problem.is_solved = True
-        problem.solved_live = True
+        mark_solved(db, user.id, problem.id, live=True)
 
     badge_award_payload = None
-    # Check badge test progress before modifying TopicMastery rating
-    active_test = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
-    
+    # Check this user's active badge test before modifying TopicMastery rating
+    active_test = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).first()
+
     p_id_norm = normalize_problem_id(problem.id)
     p_req_norm = normalize_problem_id(req.problem_id)
     p1_id_norm = normalize_problem_id(active_test.problem1_id) if active_test else ""
@@ -462,7 +317,9 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
                 active_test.status = "passed"
                 active_test.end_time = get_utc_now()
                 # Award badge!
-                mastery = db.query(TopicMastery).filter(TopicMastery.topic == active_test.topic).first()
+                mastery = db.query(TopicMastery).filter(
+                    TopicMastery.user_id == user.id, TopicMastery.topic == active_test.topic
+                ).first()
                 if mastery:
                     mastery.level = active_test.level
                     mastery.rating = max(mastery.rating, 800.0 + active_test.level * 240.0)
@@ -486,11 +343,12 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
     if not topic_list:
         topic_list = ["Arrays & Hashing"]
     for t in topic_list:
-        update_mastery_on_submission(db, t, is_success=is_success, difficulty=problem.difficulty)
-    _record_daily_activity(db, is_success=is_success)
+        update_mastery_on_submission(db, user.id, t, is_success=is_success, difficulty=problem.difficulty)
+    _record_daily_activity(db, user.id, is_success=is_success)
 
     # 3. Deduplicate rapid duplicate submission calls within 15 seconds for the same problem & code
     recent_attempt = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         Attempt.problem_id == problem.id,
         Attempt.verdict == req.verdict
     ).order_by(Attempt.id.desc()).first()
@@ -507,6 +365,7 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
     if is_success:
         # Save success attempt
         attempt = Attempt(
+            user_id=user.id,
             problem_id=problem.id,
             verdict=req.verdict,
             root_cause_category="none",
@@ -516,7 +375,7 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
             hints_used=req.hints_used
         )
         db.add(attempt)
-        update_spaced_repetition(db, problem.id)
+        update_spaced_repetition(db, user.id, problem.id)
         db.commit()
         return SubmissionAnalyzeResponse(
             root_cause_category="none",
@@ -525,8 +384,10 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
             badge_test_result=badge_award_payload
         )
 
-    # For failures, check if an assessment (Badge Test) is active
-    active_test = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
+    # For failures, check if an assessment (Badge Test) is active for this user
+    active_test = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).first()
     if active_test:
         diagnosis = {
             "root_cause_category": "assessment_locked",
@@ -537,7 +398,7 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
         # Run the LLM diagnosis if within quota
         has_quota = True
         try:
-            check_and_increment_ai_quota(db, increment=True)
+            check_and_increment_ai_quota(db, user.id, increment=True)
         except HTTPException as e:
             if e.status_code == 429:
                 has_quota = False
@@ -562,6 +423,7 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
 
     # Save failed attempt
     attempt = Attempt(
+        user_id=user.id,
         problem_id=problem.id,
         verdict=req.verdict,
         root_cause_category=diagnosis["root_cause_category"],
@@ -581,21 +443,22 @@ def analyze_submission(req: SubmissionAnalyzeRequest, db: Session = Depends(get_
 
 
 @app.post("/submissions/success")
-def record_success(problem_id: str, topic: str, time_taken_seconds: Optional[int] = None, db: Session = Depends(get_db)):
+def record_success(problem_id: str, topic: str, time_taken_seconds: Optional[int] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Direct endpoint to log a success event and update mastery.
+    Direct endpoint to log a success event and update mastery (for this user).
     """
     problem = db.query(Problem).filter(Problem.id == problem_id).first()
     if not problem:
         raise HTTPException(status_code=404, detail="Problem not found in database. Analyze first.")
 
-    problem.is_solved = True
-    problem.solved_live = True
+    mark_solved(db, user.id, problem.id, live=True)
 
     topics_to_update = [t.strip() for t in (topic or problem.topics or "Arrays & Hashing").split(",") if t.strip()]
     for t in topics_to_update:
-        # Check badge test progress
-        active_test = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
+        # Check this user's active badge test progress
+        active_test = db.query(BadgeTest).filter(
+            BadgeTest.user_id == user.id, BadgeTest.status == "active"
+        ).first()
         if active_test and active_test.topic == t:
             updated = False
             if active_test.problem1_id == problem.id and not active_test.problem1_solved:
@@ -609,14 +472,17 @@ def record_success(problem_id: str, topic: str, time_taken_seconds: Optional[int
                 if active_test.problem1_solved and active_test.problem2_solved:
                     active_test.status = "passed"
                     active_test.end_time = get_utc_now()
-                    mastery = db.query(TopicMastery).filter(TopicMastery.topic == active_test.topic).first()
+                    mastery = db.query(TopicMastery).filter(
+                        TopicMastery.user_id == user.id, TopicMastery.topic == active_test.topic
+                    ).first()
                     if mastery:
                         mastery.level = active_test.level
                     db.flush()
 
-        update_mastery_on_submission(db, t, is_success=True, difficulty=problem.difficulty)
+        update_mastery_on_submission(db, user.id, t, is_success=True, difficulty=problem.difficulty)
 
     attempt = Attempt(
+        user_id=user.id,
         problem_id=problem.id,
         verdict="Accepted",
         root_cause_category="none",
@@ -624,7 +490,7 @@ def record_success(problem_id: str, topic: str, time_taken_seconds: Optional[int
         time_taken_seconds=time_taken_seconds
     )
     db.add(attempt)
-    update_spaced_repetition(db, problem.id)
+    update_spaced_repetition(db, user.id, problem.id)
     db.commit()
     return {"status": "success", "message": "Success logged and mastery updated."}
 
@@ -647,20 +513,21 @@ STANDARD_DSA_TOPICS = [
 ]
 
 @app.get("/topics/mastery", response_model=List[TopicMasterySchema])
-def get_mastery(db: Session = Depends(get_db)):
+def get_mastery(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Returns the current mastery data for all 14 standard DSA topics,
+    Returns this user's mastery data for all 14 standard DSA topics,
     consolidating and merging any non-canonical variant topics (e.g. 'Array' -> 'Arrays').
     """
-    all_masteries = db.query(TopicMastery).all()
+    all_masteries = db.query(TopicMastery).filter(TopicMastery.user_id == user.id).all()
     canonical_set = set(STANDARD_DSA_TOPICS)
 
-    # 1. First ensure all 14 standard topics exist in DB
+    # 1. First ensure all 14 standard topics exist for this user
     existing_canonical = {m.topic: m for m in all_masteries if m.topic in canonical_set}
     newly_added = False
     for topic_name in STANDARD_DSA_TOPICS:
         if topic_name not in existing_canonical:
             new_m = TopicMastery(
+                user_id=user.id,
                 topic=topic_name,
                 level=0,
                 rating=1200.0,
@@ -682,8 +549,10 @@ def get_mastery(db: Session = Depends(get_db)):
                 if (m.level or 0) > (target_m.level or 0):
                     target_m.level = m.level
                     target_m.rating = m.rating
-                # Update any badge tests referencing this old topic name
-                db.query(BadgeTest).filter(BadgeTest.topic == m.topic).update({"topic": target_topic})
+                # Update this user's badge tests referencing this old topic name
+                db.query(BadgeTest).filter(
+                    BadgeTest.user_id == user.id, BadgeTest.topic == m.topic
+                ).update({"topic": target_topic})
             db.delete(m)
             newly_added = True
 
@@ -710,10 +579,12 @@ def get_mastery(db: Session = Depends(get_db)):
 
 
 @app.post("/badge-test/start", response_model=BadgeTestSchema)
-def start_badge_test(req: BadgeTestStartRequest, db: Session = Depends(get_db)):
+def start_badge_test(req: BadgeTestStartRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    # Check if there is already an active test
-    active = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
+    # Check if this user already has an active test
+    active = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).first()
     if active:
         elapsed = (get_utc_now() - active.start_time).total_seconds()
         time_limit = getattr(active, 'time_limit_seconds', 5400) or 5400
@@ -724,9 +595,11 @@ def start_badge_test(req: BadgeTestStartRequest, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="A Badge Test is already active.")
 
     canonical_topic = normalize_topic(req.topic)
-    mastery = db.query(TopicMastery).filter(TopicMastery.topic == canonical_topic).first()
+    mastery = db.query(TopicMastery).filter(
+        TopicMastery.user_id == user.id, TopicMastery.topic == canonical_topic
+    ).first()
     if not mastery:
-        mastery = TopicMastery(topic=canonical_topic, level=0, rating=1200.0)
+        mastery = TopicMastery(user_id=user.id, topic=canonical_topic, level=0, rating=1200.0)
         db.add(mastery)
         db.flush()
 
@@ -790,6 +663,7 @@ def start_badge_test(req: BadgeTestStartRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Not enough problems in database to start test.")
 
     test = BadgeTest(
+        user_id=user.id,
         topic=req.topic,
         level=target_level,
         problem1_id=normalize_problem_id(selected[0].id),
@@ -824,8 +698,10 @@ def start_badge_test(req: BadgeTestStartRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/badge-test/active", response_model=Optional[BadgeTestSchema])
-def get_active_badge_test(db: Session = Depends(get_db)):
-    test = db.query(BadgeTest).filter(BadgeTest.status == "active").first()
+def get_active_badge_test(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    test = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).first()
     if not test:
         return None
 
@@ -847,11 +723,13 @@ def get_active_badge_test(db: Session = Depends(get_db)):
     # Sync solved status only from Accepted attempts made during this active test session
     grace_start = (test.start_time - timedelta(seconds=120)) if test.start_time else now
     p1_accepted = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         (Attempt.problem_id.ilike(test.problem1_id) | Attempt.problem_id.ilike(p1_norm) | Attempt.problem_id.ilike(f"%{p1_norm}%")),
         Attempt.verdict.in_(["Accepted", "accepted", "success", "Success"]),
         Attempt.timestamp >= grace_start
     ).first()
     p2_accepted = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         (Attempt.problem_id.ilike(test.problem2_id) | Attempt.problem_id.ilike(p2_norm) | Attempt.problem_id.ilike(f"%{p2_norm}%")),
         Attempt.verdict.in_(["Accepted", "accepted", "success", "Success"]),
         Attempt.timestamp >= grace_start
@@ -866,7 +744,9 @@ def get_active_badge_test(db: Session = Depends(get_db)):
         if test.problem1_solved and test.problem2_solved:
             test.status = "passed"
             test.end_time = now
-            mastery = db.query(TopicMastery).filter(TopicMastery.topic == test.topic).first()
+            mastery = db.query(TopicMastery).filter(
+                TopicMastery.user_id == user.id, TopicMastery.topic == test.topic
+            ).first()
             if mastery:
                 mastery.level = test.level
                 mastery.rating = max(mastery.rating, 800.0 + test.level * 240.0)
@@ -889,8 +769,10 @@ def get_active_badge_test(db: Session = Depends(get_db)):
 
 
 @app.post("/badge-test/abandon")
-def abandon_badge_test(db: Session = Depends(get_db)):
-    tests = db.query(BadgeTest).filter(BadgeTest.status == "active").all()
+def abandon_badge_test(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    tests = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).all()
     if not tests:
         raise HTTPException(status_code=404, detail="No active Badge Test found.")
     for test in tests:
@@ -901,8 +783,10 @@ def abandon_badge_test(db: Session = Depends(get_db)):
 
 
 @app.post("/badge-test/reset-questions", response_model=BadgeTestSchema)
-def reset_badge_test_questions(db: Session = Depends(get_db)):
-    test = db.query(BadgeTest).filter(BadgeTest.status == "active").order_by(BadgeTest.id.desc()).first()
+def reset_badge_test_questions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    test = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status == "active"
+    ).order_by(BadgeTest.id.desc()).first()
     if not test:
         raise HTTPException(status_code=404, detail="No active Badge Test found to reset.")
 
@@ -979,15 +863,19 @@ def reset_badge_test_questions(db: Session = Depends(get_db)):
 
 
 @app.post("/badge-test/submit")
-def submit_badge_test(db: Session = Depends(get_db)):
-    test = db.query(BadgeTest).filter(BadgeTest.status.in_(["active", "passed"])).order_by(BadgeTest.id.desc()).first()
+def submit_badge_test(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    test = db.query(BadgeTest).filter(
+        BadgeTest.user_id == user.id, BadgeTest.status.in_(["active", "passed"])
+    ).order_by(BadgeTest.id.desc()).first()
     if not test:
         raise HTTPException(status_code=404, detail="No active Badge Test found.")
-    
+
     test.end_time = get_utc_now()
     if test.problem1_solved and test.problem2_solved:
         test.status = "passed"
-        mastery = db.query(TopicMastery).filter(TopicMastery.topic == test.topic).first()
+        mastery = db.query(TopicMastery).filter(
+            TopicMastery.user_id == user.id, TopicMastery.topic == test.topic
+        ).first()
         if mastery:
             mastery.level = test.level
             mastery.rating = max(mastery.rating, 800.0 + test.level * 240.0)
@@ -1022,15 +910,17 @@ def submit_badge_test(db: Session = Depends(get_db)):
 
 
 @app.get("/problems/next", response_model=ProblemRecommendResponse)
-def get_recommendation(company: Optional[str] = None, db: Session = Depends(get_db)):
+def get_recommendation(company: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Returns recommended problems (at least 3) and spaced repetition reviews.
+    Returns recommended problems (at least 3) and spaced repetition reviews for this user.
     If a focus topic is saved in UserConfig, recommendations prioritize that topic.
     If a company is provided, recommendations prioritize that company.
     """
-    cfg = db.query(UserConfig).filter(UserConfig.key == FOCUS_KEY).first()
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == FOCUS_KEY
+    ).first()
     focus_topic = cfg.value if cfg else None
-    result = get_next_problem(db, focus_topic=focus_topic, company=company)
+    result = get_next_problem(db, user.id, focus_topic=focus_topic, company=company)
     return ProblemRecommendResponse(
         recommendations=result["recommendations"],
         reviews=result["reviews"]
@@ -1044,10 +934,10 @@ def health():
 
 
 @app.post("/approach/check", response_model=CheckApproachResponse)
-def check_approach(req: CheckApproachRequest, db: Session = Depends(get_db)):
+def check_approach(req: CheckApproachRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Critiques the user's approach and suggests optimizations."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     result = generate_approach_critique(
         problem_title=req.problem_title,
         code=req.code,
@@ -1067,10 +957,10 @@ def check_approach(req: CheckApproachRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/hints/get", response_model=GetHintResponse)
-def get_hint(req: GetHintRequest, db: Session = Depends(get_db)):
+def get_hint(req: GetHintRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Provides a progressive, conceptual hint without revealing the solution."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     result = generate_hint(
         problem_title=req.problem_title,
         code=req.code,
@@ -1081,10 +971,10 @@ def get_hint(req: GetHintRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/hints/reveal", response_model=HintRevealResponse)
-def reveal_hint(req: HintRevealRequest, db: Session = Depends(get_db)):
+def reveal_hint(req: HintRevealRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Provides a progressive, conceptual hint at the requested level (1, 2, or 3)."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     result = generate_levelled_hint(
         problem_title=req.problem_title,
         code=req.code,
@@ -1100,10 +990,10 @@ def reveal_hint(req: HintRevealRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/edge-cases/get", response_model=GetEdgeCasesResponse)
-def get_edge_cases(req: GetEdgeCasesRequest, db: Session = Depends(get_db)):
+def get_edge_cases(req: GetEdgeCasesRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Identifies potential edge cases and critiques the problem constraints."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     result = analyze_edge_cases(
         problem_title=req.problem_title,
         code=req.code,
@@ -1117,10 +1007,10 @@ def get_edge_cases(req: GetEdgeCasesRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/help/ask", response_model=AskHelpResponse)
-def ask_help(req: AskHelpRequest, db: Session = Depends(get_db)):
+def ask_help(req: AskHelpRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Answers a user's custom question about their code or the problem."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     result = answer_custom_question(
         problem_title=req.problem_title,
         code=req.code,
@@ -1132,11 +1022,11 @@ def ask_help(req: AskHelpRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/sync/solved")
-def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
+def sync_solved(req: SyncSolvedRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Imports already-solved LeetCode problems from the user's history.
+    Imports this user's already-solved LeetCode problems from their history.
     Preserves actual solve timestamps when provided, associates synced account,
-    and updates TopicMastery baselines and Spaced Repetition queues.
+    and updates TopicMastery baselines and Spaced Repetition queues (all per user).
     """
     import json
     topics_seen = set()
@@ -1148,11 +1038,15 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
     } if prob_ids else {}
 
     existing_srs = {
-        sr.problem_id: sr for sr in db.query(SpacedRepetition).filter(SpacedRepetition.problem_id.in_(prob_ids)).all()
+        sr.problem_id: sr for sr in db.query(SpacedRepetition).filter(
+            SpacedRepetition.user_id == user.id, SpacedRepetition.problem_id.in_(prob_ids)
+        ).all()
     } if prob_ids else {}
 
     existing_attempts = {
-        a[0] for a in db.query(Attempt.problem_id).filter(Attempt.problem_id.in_(prob_ids), Attempt.verdict == "Accepted").all()
+        a[0] for a in db.query(Attempt.problem_id).filter(
+            Attempt.user_id == user.id, Attempt.problem_id.in_(prob_ids), Attempt.verdict == "Accepted"
+        ).all()
     } if prob_ids else set()
 
     now_utc = get_utc_now()
@@ -1197,11 +1091,11 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
         url = f"https://leetcode.com/problems/{prob.problem_id}/"
         problem = existing_problems.get(prob.problem_id)
         if problem:
+            # Shared catalog: refresh metadata.
             problem.title = prob.title or problem.title
             problem.url = url
             problem.difficulty = prob.difficulty or problem.difficulty
             problem.topics = topics_csv
-            problem.is_solved = True
             if prob.company and not problem.companies:
                 problem.companies = prob.company
         else:
@@ -1212,13 +1106,17 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
                 difficulty=prob.difficulty or "Medium",
                 topics=topics_csv,
                 companies=prob.company,
-                is_solved=True
             )
             db.add(problem)
+            existing_problems[prob.problem_id] = problem
+
+        # Per-user solved state.
+        mark_solved(db, user.id, prob.problem_id)
 
         # Record accepted attempt with actual solve timestamp if not already present
         if prob.problem_id not in existing_attempts:
             att = Attempt(
+                user_id=user.id,
                 problem_id=prob.problem_id,
                 verdict="Accepted",
                 root_cause_category="none",
@@ -1233,16 +1131,20 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
             # Stagger initial due dates for bulk imports across 3..25 days so reviews don't clump on one day
             stagger_days = 3 if len(req.problems) == 1 else (3 + (abs(hash(prob.problem_id)) % 22))
             sr = SpacedRepetition(
+                user_id=user.id,
                 problem_id=prob.problem_id,
                 stage=1,
                 last_solved=actual_solve_dt,
                 next_due=now_utc + timedelta(days=stagger_days)
             )
             db.add(sr)
+            existing_srs[prob.problem_id] = sr
 
-    # 2. Seed per-topic mastery from solved counts (never clobber live test badges).
+    # 2. Seed per-topic mastery (this user) from solved counts (never clobber live test badges).
     existing_masteries = {
-        tm.topic: tm for tm in db.query(TopicMastery).filter(TopicMastery.topic.in_(list(topics_seen))).all()
+        tm.topic: tm for tm in db.query(TopicMastery).filter(
+            TopicMastery.user_id == user.id, TopicMastery.topic.in_(list(topics_seen))
+        ).all()
     } if topics_seen else {}
 
     new_topics = 0
@@ -1253,6 +1155,7 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
         if not mastery:
             # Brand-new topic: seed with level 0 (Locked badge), attempts = solved_count, success_count = 0
             mastery = TopicMastery(
+                user_id=user.id,
                 topic=topic,
                 rating=800.0,
                 attempts_count=solved_count,
@@ -1267,7 +1170,7 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
                 mastery.attempts_count = solved_count
                 seeded_topics += 1
 
-    # 3. Store persistent account sync metadata in UserConfig
+    # 3. Store persistent account sync metadata in UserConfig (this user)
     username = req.username or "LeetCode User"
     sync_meta = {
         "username": username,
@@ -1275,11 +1178,13 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
         "topics_count": len(topics_seen),
         "last_synced": now_utc.strftime("%Y-%m-%d %H:%M:%S")
     }
-    cfg_account = db.query(UserConfig).filter(UserConfig.key == "synced_account").first()
+    cfg_account = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == "synced_account"
+    ).first()
     if cfg_account:
         cfg_account.value = json.dumps(sync_meta)
     else:
-        cfg_account = UserConfig(key="synced_account", value=json.dumps(sync_meta))
+        cfg_account = UserConfig(user_id=user.id, key="synced_account", value=json.dumps(sync_meta))
         db.add(cfg_account)
 
     db.commit()
@@ -1295,16 +1200,18 @@ def sync_solved(req: SyncSolvedRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/sync/account")
-def get_synced_account(db: Session = Depends(get_db)):
-    """Returns persistent account sync metadata stored in the database."""
+def get_synced_account(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's persistent account sync metadata stored in the database."""
     import json
-    cfg = db.query(UserConfig).filter(UserConfig.key == "synced_account").first()
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == "synced_account"
+    ).first()
     if cfg and cfg.value:
         try:
             return {"status": "synced", "account": json.loads(cfg.value)}
         except Exception:
             pass
-    total_solved = db.query(Problem).filter(Problem.is_solved == True).count()
+    total_solved = len(solved_problem_ids(db, user.id))
     return {
         "status": "ready",
         "account": {
@@ -1317,17 +1224,21 @@ def get_synced_account(db: Session = Depends(get_db)):
 
 
 @app.get("/problems/solved", response_model=List[SolvedProblemTableItem])
-def get_solved_problems_table(db: Session = Depends(get_db)):
+def get_solved_problems_table(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Returns all solved problems with metadata, actual solve dates, user notes,
+    Returns this user's solved problems with metadata, actual solve dates, user notes,
     personal difficulty rating, attempt counts, and spaced repetition review schedules for the interactive table.
     """
     now = get_utc_now()
-    solved_problems = db.query(Problem).filter(Problem.is_solved == True).all()
+    solved_pairs = solved_problems_for_user(db, user.id)  # (Problem, UserProblem)
+    up_by_problem = {up.problem_id: up for (_p, up) in solved_pairs}
+    solved_problems = [p for (p, _up) in solved_pairs]
 
-    sr_records = {sr.problem_id: sr for sr in db.query(SpacedRepetition).all()}
+    sr_records = {sr.problem_id: sr for sr in db.query(SpacedRepetition).filter(
+        SpacedRepetition.user_id == user.id
+    ).all()}
 
-    attempts_all = db.query(Attempt).all()
+    attempts_all = db.query(Attempt).filter(Attempt.user_id == user.id).all()
     attempts_by_problem = {}
     for a in attempts_all:
         attempts_by_problem.setdefault(a.problem_id, []).append(a)
@@ -1380,8 +1291,8 @@ def get_solved_problems_table(db: Session = Depends(get_db)):
             review_schedule=schedule_str,
             review_status=status_str,
             attempts_count=len(p_attempts),
-            user_notes=p.user_notes or "",
-            personal_difficulty=p.personal_difficulty or "",
+            user_notes=(up_by_problem.get(p.id).user_notes if up_by_problem.get(p.id) else "") or "",
+            personal_difficulty=(up_by_problem.get(p.id).personal_difficulty if up_by_problem.get(p.id) else "") or "",
             hints_used=max_hints
         ))
 
@@ -1391,10 +1302,11 @@ def get_solved_problems_table(db: Session = Depends(get_db)):
 
 
 @app.get("/reviews/count")
-def get_reviews_count(db: Session = Depends(get_db)):
-    """Returns count of active spaced repetition reviews due today (Tier 1.2)."""
+def get_reviews_count(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns count of this user's active spaced repetition reviews due today (Tier 1.2)."""
     now = get_utc_now()
     due_count = db.query(SpacedRepetition).filter(
+        SpacedRepetition.user_id == user.id,
         SpacedRepetition.next_due <= now,
         SpacedRepetition.stage < 5
     ).count()
@@ -1402,9 +1314,9 @@ def get_reviews_count(db: Session = Depends(get_db)):
 
 
 @app.post("/reviews/clear")
-def clear_reviews(db: Session = Depends(get_db)):
-    """Clears all spaced repetition review records from the database."""
-    deleted = db.query(SpacedRepetition).delete()
+def clear_reviews(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Clears this user's spaced repetition review records."""
+    deleted = db.query(SpacedRepetition).filter(SpacedRepetition.user_id == user.id).delete()
     db.commit()
     return {"deleted": deleted, "message": f"Cleared {deleted} review records."}
 
@@ -1414,9 +1326,9 @@ def clear_reviews(db: Session = Depends(get_db)):
 
 
 @app.get("/topics/analysis", response_model=TopicAnalysisResponse)
-def get_topic_analysis(db: Session = Depends(get_db)):
-    """Full breakdown of solved problems: difficulty + per-topic counts + weakest topics."""
-    solved_problems = db.query(Problem).filter(Problem.is_solved == True).all()  # noqa: E712
+def get_topic_analysis(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """This user's breakdown of solved problems: difficulty + per-topic counts + weakest topics."""
+    solved_problems = [p for (p, _up) in solved_problems_for_user(db, user.id)]
 
     # Difficulty breakdown
     difficulty_counts = {"Easy": 0, "Medium": 0, "Hard": 0}
@@ -1431,8 +1343,8 @@ def get_topic_analysis(db: Session = Depends(get_db)):
         for t in [x.strip() for x in (p.topics or "").split(",") if x.strip()]:
             topic_solved[t] += 1
 
-    # Join with mastery scores
-    mastery_rows = {m.topic: m for m in db.query(TopicMastery).all()}
+    # Join with this user's mastery scores
+    mastery_rows = {m.topic: m for m in db.query(TopicMastery).filter(TopicMastery.user_id == user.id).all()}
     items = []
     for topic, count in topic_solved.items():
         score = mastery_rows.get(topic).mastery_score if topic in mastery_rows else 0.0
@@ -1461,17 +1373,19 @@ def get_topic_analysis(db: Session = Depends(get_db)):
 
 
 @app.get("/topics/focus", response_model=FocusResponse)
-def get_focus(db: Session = Depends(get_db)):
-    """Returns the saved focus topics (up to 3)."""
-    cfg = db.query(UserConfig).filter(UserConfig.key == FOCUS_KEY).first()
+def get_focus(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's saved focus topics (up to 3)."""
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == FOCUS_KEY
+    ).first()
     val = cfg.value if cfg else ""
     topics = [t.strip() for t in val.split(",") if t.strip()] if val else []
     return FocusResponse(focus_topic=val if val else None, focus_topics=topics)
 
 
 @app.post("/topics/focus", response_model=FocusResponse)
-def set_focus(req: Optional[SetFocusRequest] = None, topic: Optional[str] = None, db: Session = Depends(get_db)):
-    """Saves (or clears) focus topics (up to 3)."""
+def set_focus(req: Optional[SetFocusRequest] = None, topic: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Saves (or clears) this user's focus topics (up to 3)."""
     val_to_save = []
     if req and req.topics is not None:
         val_to_save = [t.strip() for t in req.topics if t and t.strip()][:3]
@@ -1480,7 +1394,9 @@ def set_focus(req: Optional[SetFocusRequest] = None, topic: Optional[str] = None
     elif topic is not None:
         val_to_save = [t.strip() for t in topic.split(",") if t and t.strip()][:3]
 
-    cfg = db.query(UserConfig).filter(UserConfig.key == FOCUS_KEY).first()
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == FOCUS_KEY
+    ).first()
     if not val_to_save:
         if cfg:
             db.delete(cfg)
@@ -1491,7 +1407,7 @@ def set_focus(req: Optional[SetFocusRequest] = None, topic: Optional[str] = None
         if cfg:
             cfg.value = saved_str
         else:
-            cfg = UserConfig(key=FOCUS_KEY, value=saved_str)
+            cfg = UserConfig(user_id=user.id, key=FOCUS_KEY, value=saved_str)
             db.add(cfg)
         topics_out = val_to_save
 
@@ -1500,8 +1416,8 @@ def set_focus(req: Optional[SetFocusRequest] = None, topic: Optional[str] = None
 
 
 @app.get("/companies")
-def get_companies(db: Session = Depends(get_db)):
-    """Returns distinct list of company tags from all registered problems (Tier 1.1)."""
+def get_companies(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns distinct list of company tags from the shared problem catalog (Tier 1.1)."""
     problems = db.query(Problem).filter(Problem.companies.isnot(None)).all()
     companies = set()
     for p in problems:
@@ -1512,17 +1428,19 @@ def get_companies(db: Session = Depends(get_db)):
 
 
 @app.get("/companies/metadata")
-def get_companies_metadata(db: Session = Depends(get_db)):
-    """Returns a dictionary mapping company names to their focus notes."""
+def get_companies_metadata(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns a dictionary mapping company names to their focus notes (shared catalog)."""
     meta = db.query(CompanyMetadata).all()
     return {m.name: m.focus_note for m in meta}
 
 
 @app.get("/activity/streak", response_model=StreakResponse)
-def get_streak(db: Session = Depends(get_db)):
-    """Returns current streak days and today's activity counts (Tier 1.4)."""
+def get_streak(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's current streak days and today's activity counts (Tier 1.4)."""
     today_str = get_utc_now().strftime("%Y-%m-%d")
-    today_act = db.query(DailyActivity).filter(DailyActivity.date == today_str).first()
+    today_act = db.query(DailyActivity).filter(
+        DailyActivity.user_id == user.id, DailyActivity.date == today_str
+    ).first()
     problems_today = today_act.problems_attempted if today_act else 0
     solved_today = today_act.problems_solved if today_act else 0
 
@@ -1531,7 +1449,9 @@ def get_streak(db: Session = Depends(get_db)):
     curr_date = get_utc_now().date()
     while True:
         d_str = curr_date.strftime("%Y-%m-%d")
-        act = db.query(DailyActivity).filter(DailyActivity.date == d_str).first()
+        act = db.query(DailyActivity).filter(
+            DailyActivity.user_id == user.id, DailyActivity.date == d_str
+        ).first()
         if act and act.problems_solved > 0:
             streak += 1
             curr_date -= timedelta(days=1)
@@ -1549,22 +1469,22 @@ def get_streak(db: Session = Depends(get_db)):
 
 
 @app.get("/topics/weak-pairs", response_model=List[WeakPairItem])
-def get_weak_pairs(db: Session = Depends(get_db)):
-    """Returns co-occurring weak topic pairs (Tier 2.1)."""
-    return compute_weak_pairs(db)
+def get_weak_pairs(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's co-occurring weak topic pairs (Tier 2.1)."""
+    return compute_weak_pairs(db, user.id)
 
 
 @app.get("/topics/time-trend")
-def get_time_trend(topic: str, db: Session = Depends(get_db)):
-    """Returns recent time-spent attempts for a topic (Tier 1.3)."""
-    return get_topic_time_trend(db, topic)
+def get_time_trend(topic: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Returns this user's recent time-spent attempts for a topic (Tier 1.3)."""
+    return get_topic_time_trend(db, user.id, topic)
 
 
 @app.post("/submissions/explain-back", response_model=ExplainBackResponse)
-def explain_back(req: ExplainBackRequest, db: Session = Depends(get_db)):
+def explain_back(req: ExplainBackRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Verifies user's self-explanation against their submitted code (Tier 3.2)."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     res = generate_explain_back_check(
         code=req.code,
         language=req.language,
@@ -1577,32 +1497,36 @@ def explain_back(req: ExplainBackRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/critique/estimate")
-def store_complexity_estimate(req: ComplexityEstimateRequest, db: Session = Depends(get_db)):
-    """Stores the user's complexity guess before revealing critique (Tier 3.3)."""
-    check_active_test_lock(db, is_contest=req.is_contest)
+def store_complexity_estimate(req: ComplexityEstimateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Stores this user's complexity guess before revealing critique (Tier 3.3)."""
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
     import json
     t_comp = req.time_complexity or req.user_time or "O(N)"
     s_comp = req.space_complexity or req.user_space or "O(1)"
     key = f"estimate_{req.problem_id}"
     value = json.dumps({"time_complexity": t_comp, "space_complexity": s_comp})
-    cfg = db.query(UserConfig).filter(UserConfig.key == key).first()
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == key
+    ).first()
     if cfg:
         cfg.value = value
     else:
-        cfg = UserConfig(key=key, value=value)
+        cfg = UserConfig(user_id=user.id, key=key, value=value)
         db.add(cfg)
     db.commit()
     return {"status": "stored"}
 
 
 @app.post("/critique/reveal", response_model=ComplexityRevealResponse)
-def reveal_complexity_critique(req: ComplexityRevealRequest, db: Session = Depends(get_db)):
+def reveal_complexity_critique(req: ComplexityRevealRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Runs LLM approach critique and compares with stored self-estimate (Tier 3.3)."""
-    check_active_test_lock(db, is_contest=req.is_contest)
-    check_and_increment_ai_quota(db)
+    check_active_test_lock(db, user.id, is_contest=req.is_contest)
+    check_and_increment_ai_quota(db, user.id)
     import json
     key = f"estimate_{req.problem_id}"
-    cfg = db.query(UserConfig).filter(UserConfig.key == key).first()
+    cfg = db.query(UserConfig).filter(
+        UserConfig.user_id == user.id, UserConfig.key == key
+    ).first()
     estimate = json.loads(cfg.value) if cfg and cfg.value else None
 
     result = generate_approach_critique(
@@ -1623,10 +1547,11 @@ def reveal_complexity_critique(req: ComplexityRevealRequest, db: Session = Depen
 
 
 @app.get("/journal/weekly", response_model=WeeklyJournalResponse)
-def get_weekly_journal(db: Session = Depends(get_db)):
-    """Generates past 7 days mistake journal and aggregated stats (Tier 5.1)."""
+def get_weekly_journal(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generates this user's past 7 days mistake journal and aggregated stats (Tier 5.1)."""
     seven_days_ago = get_utc_now() - timedelta(days=7)
     attempts = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         Attempt.timestamp >= seven_days_ago,
         (Attempt.explanation_text.is_(None) | (Attempt.explanation_text != "Synced from LeetCode solved history (historical baseline)."))
     ).all()
@@ -1648,6 +1573,7 @@ def get_weekly_journal(db: Session = Depends(get_db)):
 
     # Generate a detailed list of mistakes grouped by problem
     failed_attempts = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         Attempt.timestamp >= seven_days_ago,
         Attempt.verdict != "Accepted",
         (Attempt.explanation_text.is_(None) | (Attempt.explanation_text != "Synced from LeetCode solved history (historical baseline)."))
@@ -1710,6 +1636,7 @@ def get_weekly_journal(db: Session = Depends(get_db)):
 
     # Generate a detailed list of solved problems with date solved
     accepted_attempts = db.query(Attempt).filter(
+        Attempt.user_id == user.id,
         Attempt.timestamp >= seven_days_ago,
         Attempt.verdict == "Accepted",
         (Attempt.explanation_text.is_(None) | (Attempt.explanation_text != "Synced from LeetCode solved history (historical baseline)."))
@@ -1852,9 +1779,9 @@ def save_problem_notes(problem_id: str, req: dict, user: User = Depends(get_curr
 
 
 @app.get("/export/solved-csv")
-def export_solved_csv(timeframe: str = "current_week", db: Session = Depends(get_db)):
+def export_solved_csv(timeframe: str = "current_week", user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Exports solved DSA problems to an expanded CSV spreadsheet with review dates,
+    Exports this user's solved DSA problems to an expanded CSV spreadsheet with review dates,
     user comments/notes, personal difficulty ratings, attempt counts, mistake categories, and hints used.
     """
     import csv
@@ -1862,7 +1789,7 @@ def export_solved_csv(timeframe: str = "current_week", db: Session = Depends(get
     from fastapi import Response
 
     now = get_utc_now()
-    
+
     if timeframe in ["current_week", "past_7_days"]:
         cutoff = now - timedelta(days=7)
     elif timeframe == "past_30_days":
@@ -1870,14 +1797,18 @@ def export_solved_csv(timeframe: str = "current_week", db: Session = Depends(get
     else:
         cutoff = None  # all_time
 
-    # Query all solved problems
-    solved_problems = db.query(Problem).filter(Problem.is_solved == True).all()
+    # This user's solved problems (with their per-user state)
+    solved_pairs = solved_problems_for_user(db, user.id)
+    up_by_problem = {up.problem_id: up for (_p, up) in solved_pairs}
+    solved_problems = [p for (p, _up) in solved_pairs]
 
-    # Pre-query SpacedRepetition reviews map
-    sr_records = {sr.problem_id: sr for sr in db.query(SpacedRepetition).all()}
+    # Pre-query this user's SpacedRepetition reviews map
+    sr_records = {sr.problem_id: sr for sr in db.query(SpacedRepetition).filter(
+        SpacedRepetition.user_id == user.id
+    ).all()}
 
-    # Pre-query attempts grouped by problem_id
-    attempts_all = db.query(Attempt).all()
+    # Pre-query this user's attempts grouped by problem_id
+    attempts_all = db.query(Attempt).filter(Attempt.user_id == user.id).all()
     attempts_by_problem = {}
     for a in attempts_all:
         attempts_by_problem.setdefault(a.problem_id, []).append(a)
@@ -1935,12 +1866,13 @@ def export_solved_csv(timeframe: str = "current_week", db: Session = Depends(get
             mistake_note = "None (Passed cleanly)"
 
         max_hints_used = max([a.hints_used for a in p_attempts], default=0)
+        up = up_by_problem.get(p.id)
 
         rows.append({
             "Problem Title": p.title,
             "Problem ID": p.id,
             "LeetCode Difficulty": p.difficulty or "Medium",
-            "Personal Difficulty / Flag": p.personal_difficulty or "Not Rated",
+            "Personal Difficulty / Flag": (up.personal_difficulty if up else "") or "Not Rated",
             "Topics": p.topics or "",
             "Companies": p.companies or "",
             "Date Solved": date_solved_str,
@@ -1949,7 +1881,7 @@ def export_solved_csv(timeframe: str = "current_week", db: Session = Depends(get
             "Review Status": status_str,
             "Total Attempts Count": len(p_attempts),
             "Mistake Category / Note": mistake_note,
-            "User Notes & Comments": p.user_notes or "",
+            "User Notes & Comments": (up.user_notes if up else "") or "",
             "Hints Used": max_hints_used,
             "LeetCode URL": p.url
         })

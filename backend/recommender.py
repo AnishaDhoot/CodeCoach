@@ -157,8 +157,8 @@ EPSILON = 0.15
 WEAK_PAIR_MIN_COOCCUR = 2
 WEAK_PAIR_MAX_LEVEL = 2  # Level 0 or 1 (< 40% mastery)
 
-# Module-level cache for weak pairs {result: list, computed_at: float}
-_weak_pair_cache: dict = {"result": [], "computed_at": 0.0}
+# Per-user cache for weak pairs: {user_id: {result: list, computed_at: float}}
+_weak_pair_cache: dict = {}
 _WEAK_PAIR_TTL = 3600  # seconds
 
 
@@ -168,18 +168,22 @@ _WEAK_PAIR_TTL = 3600  # seconds
 
 def update_mastery_on_submission(
     db: Session,
+    user_id: int,
     topic_name: str,
     is_success: bool,
     difficulty: str = "Medium",
 ) -> TopicMastery:
     """
     Updates TopicMastery attempt/success metrics and reschedules spaced-repetition
-    review dates. Badge levels advance exclusively via Badge Tests.
+    review dates. Badge levels advance exclusively via Badge Tests. Scoped per user.
     """
     canonical_name = normalize_topic(topic_name)
-    mastery = db.query(TopicMastery).filter(TopicMastery.topic == canonical_name).first()
+    mastery = db.query(TopicMastery).filter(
+        TopicMastery.user_id == user_id, TopicMastery.topic == canonical_name
+    ).first()
     if not mastery:
         mastery = TopicMastery(
+            user_id=user_id,
             topic=canonical_name,
             rating=1200.0,
             attempts_count=0,
@@ -251,7 +255,7 @@ def filter_problems_for_topic(problems: list, topic: str) -> list:
     return matches if matches else [p for p in problems if t_lower in (p.topics or "").lower()]
 
 
-def update_spaced_repetition(db: Session, problem_id: str) -> SpacedRepetition:
+def update_spaced_repetition(db: Session, user_id: int, problem_id: str) -> SpacedRepetition:
     """
     Saves or advances the spaced-repetition schedule for a solved problem.
 
@@ -264,10 +268,13 @@ def update_spaced_repetition(db: Session, problem_id: str) -> SpacedRepetition:
     5 → completed / mastered, far-future date
     """
     now = get_utc_now()
-    sr = db.query(SpacedRepetition).filter(SpacedRepetition.problem_id == problem_id).first()
+    sr = db.query(SpacedRepetition).filter(
+        SpacedRepetition.user_id == user_id, SpacedRepetition.problem_id == problem_id
+    ).first()
 
     if not sr:
         sr = SpacedRepetition(
+            user_id=user_id,
             problem_id=problem_id,
             stage=1,
             last_solved=now,
@@ -298,28 +305,28 @@ def update_spaced_repetition(db: Session, problem_id: str) -> SpacedRepetition:
 # Tier 2.1 — Weak-pair detection
 # ---------------------------------------------------------------------------
 
-def compute_weak_pairs(db: Session) -> list:
+def compute_weak_pairs(db: Session, user_id: int) -> list:
     """
     Finds pairs of topics that are both weak (rating < WEAK_PAIR_MAX_RATING)
-    and frequently co-occur in the same problem.
+    and frequently co-occur in the same problem, for this user.
 
     Returns a list of dicts: [{topic_a, topic_b, co_occurrence}]
-    Sorted by co_occurrence descending.  Results are cached for TTL seconds.
+    Sorted by co_occurrence descending.  Results are cached per user for TTL seconds.
     """
-    global _weak_pair_cache
     now_ts = time.time()
-    if now_ts - _weak_pair_cache["computed_at"] < _WEAK_PAIR_TTL:
-        return _weak_pair_cache["result"]
+    cached = _weak_pair_cache.get(user_id)
+    if cached and now_ts - cached["computed_at"] < _WEAK_PAIR_TTL:
+        return cached["result"]
 
     weak_masteries = (
         db.query(TopicMastery)
-        .filter(TopicMastery.level < WEAK_PAIR_MAX_LEVEL)
+        .filter(TopicMastery.user_id == user_id, TopicMastery.level < WEAK_PAIR_MAX_LEVEL)
         .all()
     )
     weak_topics = [m.topic for m in weak_masteries]
 
     if len(weak_topics) < 2:
-        _weak_pair_cache = {"result": [], "computed_at": now_ts}
+        _weak_pair_cache[user_id] = {"result": [], "computed_at": now_ts}
         return []
 
     # Count co-occurrences in the Problem table
@@ -341,14 +348,14 @@ def compute_weak_pairs(db: Session) -> list:
         for (a, b), c in sorted(pair_counts.items(), key=lambda x: -x[1])
     ]
 
-    _weak_pair_cache = {"result": result, "computed_at": now_ts}
+    _weak_pair_cache[user_id] = {"result": result, "computed_at": now_ts}
     return result
 
 
-def get_topic_time_trend(db: Session, topic_name: str) -> list:
+def get_topic_time_trend(db: Session, user_id: int, topic_name: str) -> list:
     """
-    Returns recent attempts for problems tagged with topic_name containing
-    timestamp and time_spent_seconds (Tier 1.3).
+    Returns recent attempts (for this user) for problems tagged with topic_name,
+    containing timestamp and time_spent_seconds (Tier 1.3).
     """
     problems = db.query(Problem).filter(Problem.topics.like(f"%{topic_name}%")).all()
     if not problems:
@@ -356,7 +363,7 @@ def get_topic_time_trend(db: Session, topic_name: str) -> list:
     prob_ids = [p.id for p in problems]
     attempts = (
         db.query(Attempt)
-        .filter(Attempt.problem_id.in_(prob_ids), Attempt.time_spent_seconds.isnot(None))
+        .filter(Attempt.user_id == user_id, Attempt.problem_id.in_(prob_ids), Attempt.time_spent_seconds.isnot(None))
         .order_by(desc(Attempt.timestamp))
         .limit(10)
         .all()
@@ -376,7 +383,7 @@ def get_topic_time_trend(db: Session, topic_name: str) -> list:
 # Tier 2.2 + 2.3 — Main recommender
 # ---------------------------------------------------------------------------
 
-def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict:
+def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str = None) -> dict:
     """
     Determines recommended problems and spaced-repetition review items.
 
@@ -395,8 +402,9 @@ def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict
         focus_list = [str(t).strip() for t in focus_topic if str(t).strip()]
     focus_list = focus_list[:3]
 
-    # 1. Gather active spaced-repetition reviews that are due
+    # 1. Gather active spaced-repetition reviews that are due (this user's)
     reviews_due = db.query(SpacedRepetition).filter(
+        SpacedRepetition.user_id == user_id,
         SpacedRepetition.next_due <= now,
         SpacedRepetition.stage < 5,
     ).all()
@@ -439,8 +447,8 @@ def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict
     base_pool = _pool_query()
     base_pool_ids = {p.id for p in base_pool}
 
-    # 3. Build a prioritized list of topics
-    masteries = db.query(TopicMastery).all()
+    # 3. Build a prioritized list of topics (this user's mastery)
+    masteries = db.query(TopicMastery).filter(TopicMastery.user_id == user_id).all()
     mastery_by_topic = {m.topic: m for m in masteries}
 
     focus_topic_records = []
@@ -449,6 +457,7 @@ def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict
         if not rec:
             # Create a transient record for unseeded/unattempted focus topic
             rec = TopicMastery(
+                user_id=user_id,
                 topic=f_topic,
                 level=0,
                 rating=1200.0,
@@ -532,7 +541,7 @@ def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict
         if topic_prob_ids:
             recent_attempts = (
                 db.query(Attempt)
-                .filter(Attempt.problem_id.in_(topic_prob_ids))
+                .filter(Attempt.user_id == user_id, Attempt.problem_id.in_(topic_prob_ids))
                 .order_by(desc(Attempt.timestamp))
                 .limit(3)
                 .all()
@@ -639,7 +648,7 @@ def get_next_problem(db: Session, focus_topic=None, company: str = None) -> dict
             if p_ids:
                 acc_records = (
                     db.query(Attempt.problem_id, Attempt.timestamp)
-                    .filter(Attempt.problem_id.in_(p_ids), Attempt.verdict == "Accepted")
+                    .filter(Attempt.user_id == user_id, Attempt.problem_id.in_(p_ids), Attempt.verdict == "Accepted")
                     .all()
                 )
                 for pid, ts in acc_records:

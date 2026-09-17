@@ -3,6 +3,7 @@ import time
 from backend.database import Base, engine, SessionLocal
 from backend.models import Problem, TopicMastery
 from backend.recommender import get_next_problem
+from backend.conftest import ensure_test_user
 
 @pytest.fixture(autouse=True)
 def populate_benchmark_db():
@@ -32,8 +33,9 @@ def populate_benchmark_db():
 
 def test_recommendation_latency_under_50ms(populate_benchmark_db):
     """Verifies that next problem recommendation executes in under 50ms across 100 problems."""
+    uid = ensure_test_user(populate_benchmark_db).id
     start_time = time.perf_counter()
-    res = get_next_problem(populate_benchmark_db)
+    res = get_next_problem(populate_benchmark_db, uid)
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     
     assert len(res["recommendations"]) == 3

@@ -1,4 +1,5 @@
 import pytest
+from backend.conftest import ensure_test_user
 
 @pytest.fixture(autouse=True)
 def clean_db_state():
@@ -7,12 +8,15 @@ def clean_db_state():
         if db.query(Problem).count() == 0:
             from backend.seed import seed_db
             seed_db()
+        uid = ensure_test_user(db).id
         db.query(BadgeTest).delete()
         db.query(UserConfig).filter(UserConfig.key.like("ai_limit_%")).delete()
-        # Ensure Arrays & Hashing topic mastery exists and is clean
-        ah = db.query(TopicMastery).filter(TopicMastery.topic == "Arrays & Hashing").first()
+        # Ensure this user's Arrays & Hashing topic mastery exists and is clean
+        ah = db.query(TopicMastery).filter(
+            TopicMastery.user_id == uid, TopicMastery.topic == "Arrays & Hashing"
+        ).first()
         if not ah:
-            db.add(TopicMastery(topic="Arrays & Hashing", rating=1200.0, level=0, attempts_count=0, success_count=0))
+            db.add(TopicMastery(user_id=uid, topic="Arrays & Hashing", rating=1200.0, level=0, attempts_count=0, success_count=0))
         db.commit()
     finally:
         db.close()
@@ -148,11 +152,21 @@ def test_analyze_submission_failure(mock_diagnose):
     }
 
     db = SessionLocal()
+    uid = ensure_test_user(db).id
     prob = db.query(Problem).filter(Problem.id == "contains-duplicate").first()
-    target_topic = normalize_topic([t.strip() for t in prob.topics.split(",") if t.strip()][0]) if prob and prob.topics else "Arrays & Hashing"
-    mastery_before = db.query(TopicMastery).filter(TopicMastery.topic == target_topic).first()
-    initial_attempts = mastery_before.attempts_count if mastery_before else 0
-    initial_rating = mastery_before.rating if mastery_before else 800.0
+    # analyze() increments the canonical form of EVERY topic the problem carries.
+    # If the catalog row is absent (another test file dropped it), analyze() will
+    # create it with the default "Arrays & Hashing" topic.
+    topics_str = prob.topics if (prob and prob.topics) else "Arrays & Hashing"
+    canonical_topics = {normalize_topic(t.strip()) for t in topics_str.split(",") if t.strip()}
+
+    def _attempts_sum():
+        rows = db.query(TopicMastery).filter(
+            TopicMastery.user_id == uid, TopicMastery.topic.in_(canonical_topics)
+        ).all()
+        return sum(m.attempts_count for m in rows), {m.topic: m.rating for m in rows}
+
+    initial_attempts, initial_ratings = _attempts_sum()
     db.close()
 
     response = client.post("/submissions/analyze", json=payload)
@@ -162,15 +176,19 @@ def test_analyze_submission_failure(mock_diagnose):
     assert data["root_cause_category"] == "implementation_bug"
     assert "Off-by-one" in data["explanation"]
 
-    # Verify attempt count tracked and rating unchanged
+    # Verify attempt count tracked (once per canonical topic) and ratings unchanged on failure
     db = SessionLocal()
     try:
-        mastery = db.query(TopicMastery).filter(TopicMastery.topic == target_topic).first()
-        print(f"{target_topic} rating after failure: {mastery.rating:.1f} (was {initial_rating:.1f})")
-        assert mastery.attempts_count == initial_attempts + 1
-        assert mastery.rating == initial_rating, "Rating must not change on a failed submission outside a test"
+        uid = ensure_test_user(db).id
+        after_attempts, after_ratings = _attempts_sum()
+        assert after_attempts == initial_attempts + len(canonical_topics)
+        for topic, rating in after_ratings.items():
+            if topic in initial_ratings:
+                assert rating == initial_ratings[topic], "Rating must not change on a failed submission outside a test"
 
-        latest_attempt = db.query(Attempt).filter(Attempt.problem_id == "contains-duplicate").order_by(Attempt.id.desc()).first()
+        latest_attempt = db.query(Attempt).filter(
+            Attempt.user_id == uid, Attempt.problem_id == "contains-duplicate"
+        ).order_by(Attempt.id.desc()).first()
         assert latest_attempt is not None
         assert latest_attempt.hints_used == 3
     finally:
@@ -500,22 +518,23 @@ def test_quota_concurrency_at_boundary():
     from fastapi import HTTPException
     
     db = SessionLocal()
+    uid = ensure_test_user(db).id
     today_str = get_utc_now().strftime("%Y-%m-%d")
     key = f"ai_limit_{today_str}"
-    db.query(UserConfig).filter(UserConfig.key == key).delete()
-    
+    db.query(UserConfig).filter(UserConfig.user_id == uid, UserConfig.key == key).delete()
+
     starting_used = AI_DAILY_QUOTA_LIMIT - 1
-    config_row = UserConfig(key=key, value=str(starting_used))
+    config_row = UserConfig(user_id=uid, key=key, value=str(starting_used))
     db.add(config_row)
     db.commit()
     db.close()
-    
+
     results = []
-    
+
     def run_increment():
         thread_db = SessionLocal()
         try:
-            check_and_increment_ai_quota(thread_db)
+            check_and_increment_ai_quota(thread_db, uid)
             results.append("success")
         except HTTPException as e:
             if e.status_code == 429:

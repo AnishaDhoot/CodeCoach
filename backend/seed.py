@@ -2840,27 +2840,9 @@ def seed_db():
             )
             db.add(prob)
 
-        # Seed TopicMastery for 14 main topics
-        print("Inserting topic mastery records...")
-        for topic_name in sorted(list(unique_topics)):
-            mastery = TopicMastery(
-                topic=topic_name,
-                rating=1200.0,
-                attempts_count=0,
-                success_count=0,
-                level=0
-            )
-            db.add(mastery)
-
-        # Seed "Company Practice" mastery so it renders if needed
-        company_practice_mastery = TopicMastery(
-            topic="Company Practice",
-            rating=1200.0,
-            attempts_count=0,
-            success_count=0,
-            level=0
-        )
-        db.add(company_practice_mastery)
+        # NOTE: TopicMastery is per-user now (multi-tenant). It is created on
+        # demand per user (e.g. GET /topics/mastery seeds the 14 standard topics
+        # for the calling user), so seeding is catalog-only here.
 
         db.commit()
         print("Database seeding completed successfully!")

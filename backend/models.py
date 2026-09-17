@@ -66,16 +66,15 @@ class User(Base):
 class Problem(Base):
     __tablename__ = "problems"
 
+    # Shared catalog only. Per-user state (solved status, notes, personal difficulty)
+    # lives in UserProblem — see Phase 3.
     id = Column(String, primary_key=True, index=True) # e.g. "two-sum" or "1"
     title = Column(String, nullable=False)
     url = Column(String, nullable=False)
     difficulty = Column(String, nullable=False) # Easy, Medium, Hard
     topics = Column(String, nullable=False) # Comma-separated list of topics, e.g. "Arrays,Two Pointers"
     companies = Column(String, nullable=True)  # Comma-separated company names, e.g. "Google,Amazon"
-    is_solved = Column(Boolean, default=False, nullable=False) # True once synced from LeetCode history
     is_premium = Column(Boolean, default=False, nullable=False) # True if paid/premium LeetCode problem
-    user_notes = Column(Text, nullable=True)
-    personal_difficulty = Column(String, nullable=True) # e.g. "Hard for me", "Tricky Edge Cases", "Medium", "Easy"
 
     attempts = relationship("Attempt", back_populates="problem")
 
@@ -110,8 +109,7 @@ class Attempt(Base):
     __tablename__ = "attempts"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    # Phase 2 (expand): nullable now; Phase 3 scopes reads/writes, contract phase makes it NOT NULL.
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)  # Phase 3: scoped
     problem_id = Column(String, ForeignKey("problems.id"), nullable=False)
     timestamp = Column(DateTime, default=get_utc_now, nullable=False)
     verdict = Column(String, nullable=False) # e.g., Wrong Answer, Accepted, etc.
@@ -127,9 +125,9 @@ class Attempt(Base):
 class TopicMastery(Base):
     __tablename__ = "topic_mastery"
 
+    # Phase 3: composite PK — one mastery row per (user, topic).
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, nullable=False)
     topic = Column(String, primary_key=True, index=True) # e.g., "Arrays", "Two Pointers"
-    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, topic).
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     rating = Column(Float, default=1200.0, nullable=False)
     attempts_count = Column(Integer, default=0, nullable=False)
     success_count = Column(Integer, default=0, nullable=False)
@@ -172,7 +170,7 @@ class BadgeTest(Base):
     __tablename__ = "badge_tests"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)  # Phase 2 (expand)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)  # Phase 3: scoped
     topic = Column(String, nullable=False)
     level = Column(Integer, nullable=False) # level being tested for (1-5)
     status = Column(String, default="active") # "active", "passed", "abandoned"
@@ -189,18 +187,18 @@ class UserConfig(Base):
     """Simple key/value store for user preferences (e.g. focus topic, critique estimates)."""
     __tablename__ = "user_config"
 
+    # Phase 3: composite PK — one config row per (user, key).
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, nullable=False)
     key = Column(String, primary_key=True, index=True)
-    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, key).
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     value = Column(String, nullable=True)
 
 
 class SpacedRepetition(Base):
     __tablename__ = "spaced_repetition"
 
+    # Phase 3: composite PK — one review schedule per (user, problem).
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, nullable=False)
     problem_id = Column(String, ForeignKey("problems.id"), primary_key=True, index=True)
-    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, problem_id).
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     stage = Column(Integer, default=1, nullable=False) # 1: 3 days, 2: 7 days, 3: 14 days, 4: complete
     last_solved = Column(DateTime, default=get_utc_now, nullable=False)
     next_due = Column(DateTime, nullable=False)
@@ -212,9 +210,9 @@ class DailyActivity(Base):
     """Tracks per-day attempt/solve counts for streak calculation (Tier 1.4)."""
     __tablename__ = "daily_activity"
 
+    # Phase 3: composite PK — one activity row per (user, date).
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, nullable=False)
     date = Column(String, primary_key=True)  # ISO date string "YYYY-MM-DD"
-    # Phase 2 (expand): nullable now. Contract phase moves the PK to (user_id, date).
-    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)
     problems_attempted = Column(Integer, default=0, nullable=False)
     problems_solved = Column(Integer, default=0, nullable=False)
 

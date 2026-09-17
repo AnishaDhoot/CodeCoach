@@ -14,6 +14,10 @@ from backend.tests._auth import register_user
 
 client = TestClient(app)
 
+# This module exercises real token auth + cross-user isolation; opt out of the
+# shared get_current_user override in conftest.
+pytestmark = pytest.mark.real_auth
+
 
 @pytest.fixture(autouse=True)
 def setup_db():

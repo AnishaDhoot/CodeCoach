@@ -1,8 +1,8 @@
-"""initial multi-tenant schema
+"""phase 3 multi-tenant scoping
 
-Revision ID: 6481a3450514
+Revision ID: 4bc4a7720bdb
 Revises: 
-Create Date: 2026-09-17 16:39:54.497297
+Create Date: 2026-09-17 18:57:09.957568
 """
 from typing import Sequence, Union
 
@@ -10,7 +10,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = '6481a3450514'
+revision: str = '4bc4a7720bdb'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -33,10 +33,7 @@ def upgrade() -> None:
     sa.Column('difficulty', sa.String(), nullable=False),
     sa.Column('topics', sa.String(), nullable=False),
     sa.Column('companies', sa.String(), nullable=True),
-    sa.Column('is_solved', sa.Boolean(), nullable=False),
     sa.Column('is_premium', sa.Boolean(), nullable=False),
-    sa.Column('user_notes', sa.Text(), nullable=True),
-    sa.Column('personal_difficulty', sa.String(), nullable=True),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_problems'))
     )
     with op.batch_alter_table('problems', schema=None) as batch_op:
@@ -59,7 +56,7 @@ def upgrade() -> None:
 
     op.create_table('attempts',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('problem_id', sa.String(), nullable=False),
     sa.Column('timestamp', sa.DateTime(), nullable=False),
     sa.Column('verdict', sa.String(), nullable=False),
@@ -78,7 +75,7 @@ def upgrade() -> None:
 
     op.create_table('badge_tests',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('topic', sa.String(), nullable=False),
     sa.Column('level', sa.Integer(), nullable=False),
     sa.Column('status', sa.String(), nullable=True),
@@ -96,33 +93,29 @@ def upgrade() -> None:
         batch_op.create_index(batch_op.f('ix_badge_tests_user_id'), ['user_id'], unique=False)
 
     op.create_table('daily_activity',
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('date', sa.String(), nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
     sa.Column('problems_attempted', sa.Integer(), nullable=False),
     sa.Column('problems_solved', sa.Integer(), nullable=False),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_daily_activity_user_id_users')),
-    sa.PrimaryKeyConstraint('date', name=op.f('pk_daily_activity'))
+    sa.PrimaryKeyConstraint('user_id', 'date', name=op.f('pk_daily_activity'))
     )
-    with op.batch_alter_table('daily_activity', schema=None) as batch_op:
-        batch_op.create_index(batch_op.f('ix_daily_activity_user_id'), ['user_id'], unique=False)
-
     op.create_table('spaced_repetition',
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('problem_id', sa.String(), nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
     sa.Column('stage', sa.Integer(), nullable=False),
     sa.Column('last_solved', sa.DateTime(), nullable=False),
     sa.Column('next_due', sa.DateTime(), nullable=False),
     sa.ForeignKeyConstraint(['problem_id'], ['problems.id'], name=op.f('fk_spaced_repetition_problem_id_problems')),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_spaced_repetition_user_id_users')),
-    sa.PrimaryKeyConstraint('problem_id', name=op.f('pk_spaced_repetition'))
+    sa.PrimaryKeyConstraint('user_id', 'problem_id', name=op.f('pk_spaced_repetition'))
     )
     with op.batch_alter_table('spaced_repetition', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_spaced_repetition_problem_id'), ['problem_id'], unique=False)
-        batch_op.create_index(batch_op.f('ix_spaced_repetition_user_id'), ['user_id'], unique=False)
 
     op.create_table('topic_mastery',
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('topic', sa.String(), nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
     sa.Column('rating', sa.Float(), nullable=False),
     sa.Column('attempts_count', sa.Integer(), nullable=False),
     sa.Column('success_count', sa.Integer(), nullable=False),
@@ -130,22 +123,20 @@ def upgrade() -> None:
     sa.Column('last_updated', sa.DateTime(), nullable=False),
     sa.Column('next_review_date', sa.DateTime(), nullable=True),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_topic_mastery_user_id_users')),
-    sa.PrimaryKeyConstraint('topic', name=op.f('pk_topic_mastery'))
+    sa.PrimaryKeyConstraint('user_id', 'topic', name=op.f('pk_topic_mastery'))
     )
     with op.batch_alter_table('topic_mastery', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_topic_mastery_topic'), ['topic'], unique=False)
-        batch_op.create_index(batch_op.f('ix_topic_mastery_user_id'), ['user_id'], unique=False)
 
     op.create_table('user_config',
+    sa.Column('user_id', sa.Integer(), nullable=False),
     sa.Column('key', sa.String(), nullable=False),
-    sa.Column('user_id', sa.Integer(), nullable=True),
     sa.Column('value', sa.String(), nullable=True),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], name=op.f('fk_user_config_user_id_users')),
-    sa.PrimaryKeyConstraint('key', name=op.f('pk_user_config'))
+    sa.PrimaryKeyConstraint('user_id', 'key', name=op.f('pk_user_config'))
     )
     with op.batch_alter_table('user_config', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_user_config_key'), ['key'], unique=False)
-        batch_op.create_index(batch_op.f('ix_user_config_user_id'), ['user_id'], unique=False)
 
     op.create_table('user_problems',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
@@ -177,23 +168,17 @@ def downgrade() -> None:
 
     op.drop_table('user_problems')
     with op.batch_alter_table('user_config', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_user_config_user_id'))
         batch_op.drop_index(batch_op.f('ix_user_config_key'))
 
     op.drop_table('user_config')
     with op.batch_alter_table('topic_mastery', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_topic_mastery_user_id'))
         batch_op.drop_index(batch_op.f('ix_topic_mastery_topic'))
 
     op.drop_table('topic_mastery')
     with op.batch_alter_table('spaced_repetition', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_spaced_repetition_user_id'))
         batch_op.drop_index(batch_op.f('ix_spaced_repetition_problem_id'))
 
     op.drop_table('spaced_repetition')
-    with op.batch_alter_table('daily_activity', schema=None) as batch_op:
-        batch_op.drop_index(batch_op.f('ix_daily_activity_user_id'))
-
     op.drop_table('daily_activity')
     with op.batch_alter_table('badge_tests', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_badge_tests_user_id'))

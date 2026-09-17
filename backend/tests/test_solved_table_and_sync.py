@@ -111,9 +111,9 @@ def test_company_fallback_to_focused_and_weak_topics():
     """Verifies that company recommendation with no company matches falls back to focused/weak topics."""
     db = SessionLocal()
     # Create non-company problems with valid urls
-    p1 = Problem(id="tree-node-1", title="Tree Node 1", url="https://leetcode.com/problems/tree-node-1/", difficulty="Easy", topics="Trees", is_solved=False)
-    p2 = Problem(id="tree-node-2", title="Tree Node 2", url="https://leetcode.com/problems/tree-node-2/", difficulty="Easy", topics="Trees", is_solved=False)
-    p3 = Problem(id="tree-node-3", title="Tree Node 3", url="https://leetcode.com/problems/tree-node-3/", difficulty="Easy", topics="Trees", is_solved=False)
+    p1 = Problem(id="tree-node-1", title="Tree Node 1", url="https://leetcode.com/problems/tree-node-1/", difficulty="Easy", topics="Trees")
+    p2 = Problem(id="tree-node-2", title="Tree Node 2", url="https://leetcode.com/problems/tree-node-2/", difficulty="Easy", topics="Trees")
+    p3 = Problem(id="tree-node-3", title="Tree Node 3", url="https://leetcode.com/problems/tree-node-3/", difficulty="Easy", topics="Trees")
     db.merge(p1)
     db.merge(p2)
     db.merge(p3)
@@ -139,7 +139,7 @@ def test_company_fallback_to_focused_and_weak_topics():
 def test_weekly_journal_ai_insights():
     """Verifies GET /journal/weekly returns AI insights fields and markdown sections."""
     db = SessionLocal()
-    p = Problem(id="two-sum", title="Two Sum", url="https://leetcode.com/problems/two-sum/", difficulty="Easy", topics="Arrays & Hashing", is_solved=True)
+    p = Problem(id="two-sum", title="Two Sum", url="https://leetcode.com/problems/two-sum/", difficulty="Easy", topics="Arrays & Hashing")
     att = Attempt(problem_id="two-sum", verdict="Accepted", timestamp=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1))
     db.merge(p)
     db.add(att)
