@@ -26,17 +26,26 @@ deploying that backend and pointing the extension at it.
 | `EXTRA_CORS_ORIGINS` | – | Comma-separated extra web origins. |
 | `CHROME_EXTENSION_ID` | – | Pin CORS to your published extension id. Unset → any `chrome-extension://` origin is allowed (fine pre-launch). |
 
-## Option A — Render (blueprint)
+## Free stack (recommended): Render free web service + Neon Postgres + Groq
 
-1. Push this repo to GitHub.
-2. Render → **New + → Blueprint** → select the repo. It reads [`render.yaml`](render.yaml):
-   creates `codecoach-db` (Postgres) and `codecoach-backend` (Docker web service),
-   wiring `DATABASE_URL` automatically.
-3. In the service's **Environment**, set `GROQ_API_KEY` (and optionally
-   `EXTRA_CORS_ORIGINS` / `CHROME_EXTENSION_ID`).
-4. Deploy. `preDeployCommand: alembic upgrade head` runs migrations before traffic;
-   `RUN_MIGRATIONS=0` stops the entrypoint from double-running them.
-5. Verify: `curl https://<service>.onrender.com/health` → `{"status":"ok"}`.
+All three are $0 and sustainable. Render's own free Postgres **expires after 30 days**,
+so the DB lives on **Neon** (free tier is persistent).
+
+1. **Neon** — create a free project at [neon.tech](https://neon.tech). Copy the
+   connection string (starts `postgresql://…`). This is your `DATABASE_URL`.
+2. **Groq** — create a free API key at [console.groq.com](https://console.groq.com).
+3. Push this repo to GitHub.
+4. Render → **New + → Blueprint** → select the repo. It reads [`render.yaml`](render.yaml)
+   and creates `codecoach-backend` (free Docker web service). No Render DB is provisioned.
+5. In the service's **Environment**, set the secrets: `DATABASE_URL` (Neon),
+   `GROQ_API_KEY` (Groq), and optionally `EXTRA_CORS_ORIGINS` / `CHROME_EXTENSION_ID`.
+6. Deploy. Migrations run at boot (`RUN_MIGRATIONS=1`) — safe on the single free instance.
+7. Verify: `curl https://<service>.onrender.com/health` → `{"status":"ok"}`.
+
+> Free-plan caveat: the web service sleeps after ~15 min idle and cold-starts
+> (~30–60s) on the next request. Fine for personal use; upgrade the plan later if
+> you want it always-on. For a paid, always-on setup, switch `plan: free` → `starter`,
+> set `RUN_MIGRATIONS=0`, and add `preDeployCommand: "alembic upgrade head"`.
 
 ## Option B — Fly.io
 

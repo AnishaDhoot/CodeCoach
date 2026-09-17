@@ -1,25 +1,30 @@
-# Render blueprint — one Postgres database + the FastAPI backend.
-# Deploy: push this repo, then in Render → "New +" → "Blueprint" and pick it.
-# Set the two `sync: false` secrets (GROQ_API_KEY, optionally EXTRA_CORS_ORIGINS)
-# in the dashboard after the first sync.
+# Render blueprint — FREE FastAPI backend (web service on Render's free plan).
+#
+# Database: Render's own free Postgres EXPIRES after 30 days, so this blueprint
+# does NOT provision one. Use a persistent free Postgres from Neon
+# (https://neon.tech) instead, and paste its connection string as the
+# DATABASE_URL secret in the Render dashboard after the first sync.
+#
+# Deploy: push this repo, then Render → "New +" → "Blueprint" and pick it.
+# Then set the `sync: false` secrets (DATABASE_URL, GROQ_API_KEY) in the dashboard.
+#
+# Free-plan caveats: the service sleeps after ~15 min idle and cold-starts on the
+# next request; migrations run at boot (free plan has no pre-deploy command), which
+# is safe because there is only ever one free instance.
 services:
   - type: web
     name: codecoach-backend
     runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: starter
+    plan: free
     healthCheckPath: /health
-    # Run migrations exactly once per deploy, before the new version serves traffic.
-    preDeployCommand: "alembic upgrade head"
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: codecoach-db
-          property: connectionString
-      - key: RUN_MIGRATIONS      # entrypoint skips migrations; preDeployCommand owns them
-        value: "0"
-      - key: WEB_CONCURRENCY
-        value: "2"
+      - key: DATABASE_URL        # paste your Neon connection string (starts with postgresql://)
+        sync: false
+      - key: RUN_MIGRATIONS      # entrypoint runs `alembic upgrade head` on boot (single free instance)
+        value: "1"
+      - key: WEB_CONCURRENCY     # 1 worker fits the free plan's memory
+        value: "1"
       - key: AI_DAILY_QUOTA_LIMIT
         value: "50"
       - key: GROQ_MODEL
@@ -30,9 +35,3 @@ services:
         sync: false
       - key: CHROME_EXTENSION_ID # optional; pin CORS to your published extension id
         sync: false
-
-databases:
-  - name: codecoach-db
-    plan: basic-256mb
-    databaseName: codecoach
-    user: codecoach
