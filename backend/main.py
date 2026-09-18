@@ -720,18 +720,24 @@ def get_active_badge_test(user: User = Depends(get_current_user), db: Session = 
     p1 = db.query(Problem).filter((Problem.id == test.problem1_id) | (Problem.id == p1_norm)).first()
     p2 = db.query(Problem).filter((Problem.id == test.problem2_id) | (Problem.id == p2_norm)).first()
 
-    # Sync solved status only from Accepted attempts made during this active test session
+    # Sync solved status only from Accepted attempts made during this active test session.
+    # Match the problem id EXACTLY (case-insensitively) — never as a substring, or one
+    # problem whose slug contains the other's (e.g. "two-sum" ⊂ "two-sum-ii") would
+    # falsely mark BOTH solved from a single solve, prematurely "passing" the test.
     grace_start = (test.start_time - timedelta(seconds=120)) if test.start_time else now
+    _accepted_verdicts = ["Accepted", "accepted", "success", "Success"]
+    p1_ids = list({test.problem1_id, p1_norm})
+    p2_ids = list({test.problem2_id, p2_norm})
     p1_accepted = db.query(Attempt).filter(
         Attempt.user_id == user.id,
-        (Attempt.problem_id.ilike(test.problem1_id) | Attempt.problem_id.ilike(p1_norm) | Attempt.problem_id.ilike(f"%{p1_norm}%")),
-        Attempt.verdict.in_(["Accepted", "accepted", "success", "Success"]),
+        Attempt.problem_id.in_(p1_ids),
+        Attempt.verdict.in_(_accepted_verdicts),
         Attempt.timestamp >= grace_start
     ).first()
     p2_accepted = db.query(Attempt).filter(
         Attempt.user_id == user.id,
-        (Attempt.problem_id.ilike(test.problem2_id) | Attempt.problem_id.ilike(p2_norm) | Attempt.problem_id.ilike(f"%{p2_norm}%")),
-        Attempt.verdict.in_(["Accepted", "accepted", "success", "Success"]),
+        Attempt.problem_id.in_(p2_ids),
+        Attempt.verdict.in_(_accepted_verdicts),
         Attempt.timestamp >= grace_start
     ).first()
 
