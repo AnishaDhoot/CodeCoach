@@ -2700,11 +2700,15 @@ def seed_db(skip_github: bool = False):
         existing_problem_ids = {pid for (pid,) in db.query(Problem.id).all()}
         existing_company_names = {name for (name,) in db.query(CompanyMetadata.name).all()}
 
-        # Fast path: if the catalog already looks fully seeded, skip the (slow,
-        # network-bound) rebuild entirely so every boot doesn't re-fetch GitHub.
+        # Fast path: if the catalog already looks FULLY seeded (rich company data,
+        # ~3000 problems), skip the slow network rebuild so every boot doesn't
+        # re-fetch GitHub. The threshold is above the ~330 base-topic-only count so
+        # a previously sparse seed (base only) still gets upgraded to the rich one.
         # Set SEED_FORCE=1 to override (e.g. to pull newly-published questions).
         forced = os.getenv("SEED_FORCE", "").lower() in ("1", "true", "yes")
-        if len(existing_problem_ids) >= 300 and not forced:
+        skip_net = os.getenv("SEED_SKIP_GITHUB", "").lower() in ("1", "true", "yes") or skip_github
+        threshold = 300 if skip_net else 1000
+        if len(existing_problem_ids) >= threshold and not forced:
             print(f"Catalog already seeded ({len(existing_problem_ids)} problems); skipping.")
             return
 
