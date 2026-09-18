@@ -25,8 +25,10 @@ services:
         value: "1"
       - key: SEED_ON_START       # seed the problem catalog on boot (idempotent, non-destructive)
         value: "1"
-      - key: SEED_SKIP_GITHUB    # skip per-company GitHub fetch at boot (fast, network-free)
-        value: "1"
+      # SEED_SKIP_GITHUB unset -> the FIRST boot fetches rich per-company question
+      # lists from GitHub (so company filtering has real data). Subsequent boots
+      # short-circuit once the catalog is seeded (>=300 problems), so they stay fast.
+      # Set SEED_SKIP_GITHUB=1 if the first-boot GitHub fetch is unreliable in your region.
       - key: WEB_CONCURRENCY     # 1 worker fits the free plan's memory
         value: "1"
       - key: AI_DAILY_QUOTA_LIMIT

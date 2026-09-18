@@ -253,6 +253,9 @@ const handleVerdictDetected = (verdict, source = 'dom') => {
             });
             if (response.data?.badge_test_result && window.dsaTutor?.showBadgeAwardModal) {
               window.dsaTutor.showBadgeAwardModal(response.data.badge_test_result);
+            } else if (window.dsaTutor?.fetchActiveTest) {
+              // Refresh badge-test progress immediately after a solve.
+              window.dsaTutor.fetchActiveTest();
             }
           } else {
             window.dsaTutor?.setError(response?.error || 'Failed to record success submission.');

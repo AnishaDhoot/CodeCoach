@@ -56,27 +56,35 @@ export default function App() {
     }
   };
 
-  const fetchActiveTest = () => {
+  const fetchActiveTest = (retriesLeft = 4) => {
     chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
-      if (res && res.success && res.data) {
-        setActiveTest(res.data);
-        const timeLimit = res.data.time_limit_seconds || 5400;
-        const elapsed = res.data.elapsed_seconds || 0;
-        const remaining = timeLimit - elapsed;
-        setTestTimerSeconds(remaining > 0 ? remaining : 0);
-        if (window.dsaTutor?.setAssessmentLocked) {
-          window.dsaTutor.setAssessmentLocked(true, 'Badge Test');
+      if (res && res.success) {
+        // Backend responded authoritatively.
+        if (res.data) {
+          setActiveTest(res.data);
+          const timeLimit = res.data.time_limit_seconds || 5400;
+          const elapsed = res.data.elapsed_seconds || 0;
+          const remaining = timeLimit - elapsed;
+          setTestTimerSeconds(remaining > 0 ? remaining : 0);
+          if (window.dsaTutor?.setAssessmentLocked) {
+            window.dsaTutor.setAssessmentLocked(true, 'Badge Test');
+          }
+          if (window.dsaTutor?.resetEditor) {
+            window.dsaTutor.resetEditor();
+            [200, 600, 1200, 2200].forEach(d => {
+              setTimeout(() => {
+                if (window.dsaTutor?.resetEditor) window.dsaTutor.resetEditor();
+              }, d);
+            });
+          }
+        } else {
+          // Confirmed: no active test.
+          setActiveTest(null);
         }
-        if (window.dsaTutor?.resetEditor) {
-          window.dsaTutor.resetEditor();
-          [200, 600, 1200, 2200].forEach(d => {
-            setTimeout(() => {
-              if (window.dsaTutor?.resetEditor) window.dsaTutor.resetEditor();
-            }, d);
-          });
-        }
-      } else {
-        setActiveTest(null);
+      } else if (retriesLeft > 0) {
+        // Transient failure (e.g. cold/free backend, timeout). Do NOT wipe the
+        // badge-test UI — retry so an in-progress test survives a page reload.
+        setTimeout(() => fetchActiveTest(retriesLeft - 1), 2000);
       }
     });
   };

@@ -8,6 +8,10 @@ fixture has dropped/recreated the schema.
 Tests that must exercise REAL auth (401s, cross-user isolation) opt out with:
     pytestmark = pytest.mark.real_auth
 """
+import os
+# Tests seed the catalog offline (bundled fallback lists) — fast and no network.
+os.environ.setdefault("SEED_SKIP_GITHUB", "1")
+
 import pytest
 from datetime import datetime, timezone
 from fastapi import Depends

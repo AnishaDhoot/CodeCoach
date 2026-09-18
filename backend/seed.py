@@ -2700,6 +2700,14 @@ def seed_db(skip_github: bool = False):
         existing_problem_ids = {pid for (pid,) in db.query(Problem.id).all()}
         existing_company_names = {name for (name,) in db.query(CompanyMetadata.name).all()}
 
+        # Fast path: if the catalog already looks fully seeded, skip the (slow,
+        # network-bound) rebuild entirely so every boot doesn't re-fetch GitHub.
+        # Set SEED_FORCE=1 to override (e.g. to pull newly-published questions).
+        forced = os.getenv("SEED_FORCE", "").lower() in ("1", "true", "yes")
+        if len(existing_problem_ids) >= 300 and not forced:
+            print(f"Catalog already seeded ({len(existing_problem_ids)} problems); skipping.")
+            return
+
         # 1. Parse base problems from the 14-topic JSON data structure
         problems_dict = {}
         unique_topics = set()
