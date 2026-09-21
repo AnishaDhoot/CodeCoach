@@ -586,6 +586,7 @@ window.addEventListener("message", (event) => {
           if (match && match.code) {
             console.log('[DSA Tutor Injected] Applied official starter code via GraphQL for', titleSlug, match.langSlug);
             bestModel.setValue(match.code);
+            if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
             [20, 80, 200, 500, 1000].forEach(delay => setTimeout(tryConfirmModal, delay));
             return true;
           }
@@ -625,6 +626,7 @@ window.addEventListener("message", (event) => {
               debugReset('Snapshot fallback applied', { uri: key, length: initialCode.length });
               console.warn('[DSA Tutor Injected] Native reset button not found — falling back to snapshot');
               bestModel.setValue(initialCode);
+              if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
               [20, 80, 200, 500, 1000].forEach(delay => setTimeout(tryConfirmModal, delay));
             }
           }
@@ -837,3 +839,64 @@ setInterval(() => {
 window.__dsaTutorInjectedReady = true;
 window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
 
+// ---------------------------------------------------------------------------
+// Early Badge Test pre-reset.
+// The extension UI learns about an active Badge Test via an async backend call,
+// so LeetCode's own hydration (which restores the user's previous answer) wins
+// the race and the old answer is briefly visible. App.jsx mirrors the active
+// test into localStorage (same origin as this page-world script), so we can
+// know synchronously at injection time: hide the editor, run the reset as soon
+// as Monaco is ready, then reveal it. The backend check in App.jsx remains
+// authoritative and posts REVEAL_EDITOR if the cached test turns out stale.
+// ---------------------------------------------------------------------------
+(function () {
+  const CACHE_KEY = 'dsaTutorActiveBadgeTest';
+  const STYLE_ID = 'dsa-tutor-early-mask';
+  let revealed = false;
+
+  const readCache = () => {
+    try {
+      const raw = window.localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      const c = JSON.parse(raw);
+      if (!c || !c.data || !c.cachedAt) return null;
+      const limit = c.data.time_limit_seconds || 5400;
+      const elapsed = (c.data.elapsed_seconds || 0) + (Date.now() - c.cachedAt) / 1000;
+      return elapsed < limit ? c : null;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const reveal = () => {
+    if (revealed) return;
+    revealed = true;
+    const el = document.getElementById(STYLE_ID);
+    if (el) el.remove();
+  };
+  window.__dsaRevealEditor = reveal;
+  window.__dsaRevealEditorSoon = () => setTimeout(reveal, 600);
+
+  window.addEventListener('message', (event) => {
+    if (event.source === window && event.data && event.data.type === 'REVEAL_EDITOR') reveal();
+  });
+
+  if (!/\/problems\/[^/]+/.test(window.location.pathname)) return;
+  if (!readCache()) return;
+
+  window.__dsaTutorAssessmentLocked = true;
+  window.__dsaTutorLockReason = 'Badge Test';
+
+  const style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = '.monaco-editor { visibility: hidden !important; }';
+  (document.head || document.documentElement).appendChild(style);
+
+  [0, 250, 600, 1000, 1600, 2400].forEach((d) =>
+    setTimeout(() => {
+      if (!revealed) window.postMessage({ type: 'RESET_EDITOR' }, '*');
+    }, d)
+  );
+  // Failsafe: never leave the editor hidden.
+  setTimeout(reveal, 4000);
+})();

@@ -9,6 +9,36 @@ const CATEGORY_MAP = {
   unclear: { label: 'Diagnostics Unclear', color: '#9ca3af', emoji: '❔' }
 };
 
+// Active Badge Test is mirrored into localStorage (same origin as the page, so
+// injected.js can read it too) so the UI and editor lock can be applied
+// synchronously on load instead of after a backend round trip.
+const ACTIVE_TEST_CACHE_KEY = 'dsaTutorActiveBadgeTest';
+
+const readCachedActiveTest = () => {
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_TEST_CACHE_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (!c || !c.data || !c.cachedAt) return null;
+    const limit = c.data.time_limit_seconds || 5400;
+    const elapsed = (c.data.elapsed_seconds || 0) + (Date.now() - c.cachedAt) / 1000;
+    if (elapsed >= limit) return null;
+    return { data: c.data, remaining: Math.floor(limit - elapsed) };
+  } catch (e) {
+    return null;
+  }
+};
+
+const writeCachedActiveTest = (data) => {
+  try {
+    if (data) {
+      window.localStorage.setItem(ACTIVE_TEST_CACHE_KEY, JSON.stringify({ data, cachedAt: Date.now() }));
+    } else {
+      window.localStorage.removeItem(ACTIVE_TEST_CACHE_KEY);
+    }
+  } catch (e) { /* storage unavailable */ }
+};
+
 export default function App() {
   const isContestMode = typeof window !== 'undefined' && (window.location.href.includes('/contest/') || window.location.pathname.startsWith('/contest'));
   const [autoOpenedReviews, setAutoOpenedReviews] = useState(false);
@@ -34,8 +64,12 @@ export default function App() {
   };
 
   // Badge Test states
-  const [activeTest, setActiveTest] = useState(null);
-  const [testTimerSeconds, setTestTimerSeconds] = useState(5400); // 1.5 hours default
+  // Seed from the local cache so a reload mid-test renders the Badge Test view
+  // immediately; fetchActiveTest() below verifies it against the backend.
+  const cachedTestRef = useRef(undefined);
+  if (cachedTestRef.current === undefined) cachedTestRef.current = readCachedActiveTest();
+  const [activeTest, setActiveTest] = useState(cachedTestRef.current ? cachedTestRef.current.data : null);
+  const [testTimerSeconds, setTestTimerSeconds] = useState(cachedTestRef.current ? cachedTestRef.current.remaining : 5400); // 1.5 hours default
   const [badgeAwardModal, setBadgeAwardModal] = useState(null);
 
   // Code Coach states (persistent per tool)
@@ -78,8 +112,10 @@ export default function App() {
             });
           }
         } else {
-          // Confirmed: no active test.
+          // Confirmed: no active test (also clears any stale cached test).
           setActiveTest(null);
+          writeCachedActiveTest(null);
+          window.postMessage({ type: 'REVEAL_EDITOR' }, '*');
         }
       } else if (retriesLeft > 0) {
         // Transient failure (e.g. cold/free backend, timeout). Do NOT wipe the
@@ -720,6 +756,11 @@ export default function App() {
   }, [currentProblemId, activeTest]);
 
 
+
+  // Keep the local cache in sync with the active test.
+  useEffect(() => {
+    writeCachedActiveTest(activeTest);
+  }, [activeTest]);
 
   // Active Badge Test Live Poller to instantly reflect solved problems
   useEffect(() => {

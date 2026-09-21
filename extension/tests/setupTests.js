@@ -103,4 +103,5 @@ global.chrome = {
 beforeEach(() => {
   vi.clearAllMocks();
   chrome.storage.local.clear();
+  try { window.localStorage.clear(); } catch (e) { /* ignore */ }
 });
