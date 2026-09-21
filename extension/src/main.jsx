@@ -232,6 +232,9 @@ const handleVerdictDetected = (verdict, source = 'dom') => {
     window.dsaTutor?.setLoading(true);
 
     if (verdict === 'Accepted') {
+      // Reflect the solve in the Badge Test panel immediately; the backend
+      // round trips below reconcile it.
+      window.dsaTutor?.markProblemSolvedOptimistic?.(problemId);
       chrome.runtime.sendMessage({
         action: 'analyze_submission',
         payload: {
@@ -258,6 +261,7 @@ const handleVerdictDetected = (verdict, source = 'dom') => {
               window.dsaTutor.fetchActiveTest();
             }
           } else {
+            window.dsaTutor?.revertOptimisticSolved?.();
             window.dsaTutor?.setError(response?.error || 'Failed to record success submission.');
           }
         } finally {

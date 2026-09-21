@@ -39,6 +39,12 @@ const writeCachedActiveTest = (data) => {
   } catch (e) { /* storage unavailable */ }
 };
 
+const slugOf = (p) => {
+  if (!p) return '';
+  const m = String(p.url || '').match(/problems\/([^/?#]+)/);
+  return (m ? m[1] : String(p.id || '')).toLowerCase();
+};
+
 export default function App() {
   const isContestMode = typeof window !== 'undefined' && (window.location.href.includes('/contest/') || window.location.pathname.startsWith('/contest'));
   const [autoOpenedReviews, setAutoOpenedReviews] = useState(false);
@@ -90,12 +96,27 @@ export default function App() {
     }
   };
 
+  // Optimistic "solved" flags: set the instant an Accepted verdict is seen on a
+  // Badge Test problem, so the UI doesn't wait for the backend round trips.
+  // Backend data is merged with these until the backend confirms (or the
+  // analyze call fails and we revert).
+  const optimisticSolvedRef = useRef({ testId: null, p1: false, p2: false });
+
+  const mergeOptimisticSolved = (data) => {
+    const o = optimisticSolvedRef.current;
+    if (!data || o.testId !== data.id) return data;
+    const out = { ...data };
+    if (o.p1) { if (data.problem1_solved) o.p1 = false; else out.problem1_solved = true; }
+    if (o.p2) { if (data.problem2_solved) o.p2 = false; else out.problem2_solved = true; }
+    return out;
+  };
+
   const fetchActiveTest = (retriesLeft = 4) => {
     chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
       if (res && res.success) {
         // Backend responded authoritatively.
         if (res.data) {
-          setActiveTest(res.data);
+          setActiveTest(mergeOptimisticSolved(res.data));
           const timeLimit = res.data.time_limit_seconds || 5400;
           const elapsed = res.data.elapsed_seconds || 0;
           const remaining = timeLimit - elapsed;
@@ -768,7 +789,7 @@ export default function App() {
     const pollInterval = setInterval(() => {
       chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
         if (res && res.success && res.data) {
-          setActiveTest(res.data);
+          setActiveTest(mergeOptimisticSolved(res.data));
         }
       });
     }, 2000);
@@ -839,6 +860,28 @@ export default function App() {
     // main.jsx (getCode/getLanguage/getConstraints/getIdentity) are preserved.
     window.dsaTutor = Object.assign(window.dsaTutor || {}, {
       fetchActiveTest: fetchActiveTest,
+      markProblemSolvedOptimistic: (problemId) => {
+        const id = String(problemId || '').toLowerCase();
+        if (!id) return;
+        setActiveTest(prev => {
+          if (!prev) return prev;
+          const o = optimisticSolvedRef.current;
+          if (o.testId !== prev.id) { o.testId = prev.id; o.p1 = false; o.p2 = false; }
+          const next = { ...prev };
+          if (slugOf(prev.problem1) === id && !prev.problem1_solved) { next.problem1_solved = true; o.p1 = true; }
+          else if (slugOf(prev.problem2) === id && !prev.problem2_solved) { next.problem2_solved = true; o.p2 = true; }
+          else return prev;
+          return next;
+        });
+      },
+      revertOptimisticSolved: () => {
+        const o = optimisticSolvedRef.current;
+        const { p1, p2 } = o;
+        o.p1 = false; o.p2 = false;
+        if (!p1 && !p2) return;
+        // Re-sync from the backend, which is authoritative.
+        fetchActiveTest();
+      },
       fetchMastery: fetchMastery,
       showBadgeAwardModal: (awardData) => {
         setBadgeAwardModal(awardData);
