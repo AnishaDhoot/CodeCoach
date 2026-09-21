@@ -48,8 +48,13 @@ def get_current_user_optional(
         return None
     user = db.query(User).filter(User.device_token == token).first()
     if user:
-        user.last_seen = get_utc_now()
-        db.commit()
+        # last_seen is an activity metric, not a heartbeat: writing it on every
+        # request costs a commit round trip each time (the extension fires ~10
+        # requests per page load). Refresh at most once a minute.
+        now = get_utc_now()
+        if not user.last_seen or (now - user.last_seen).total_seconds() > 60:
+            user.last_seen = now
+            db.commit()
     return user
 
 

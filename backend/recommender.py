@@ -5,6 +5,7 @@ Badges and topic mastery levels (0-5) are unlocked strictly via Badge Tests.
 
 import random
 import time
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
 def get_utc_now() -> datetime:
@@ -12,6 +13,51 @@ def get_utc_now() -> datetime:
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from backend.models import Problem, Attempt, TopicMastery, SpacedRepetition, KNOWN_PREMIUM_SLUGS
+from backend.database import is_testing
+
+# ---------------------------------------------------------------------------
+# In-memory catalog cache
+# The non-premium problem catalog (~3k rows) changes only when the seed runs,
+# but the recommender used to re-read every full row on every request — a
+# megabyte over the wire per call against a hosted Postgres. Cache a
+# lightweight snapshot for a few minutes (disabled under tests so they always
+# see fresh rows).
+# ---------------------------------------------------------------------------
+_CatalogProblem = namedtuple(
+    "_CatalogProblem", "id title url difficulty topics companies is_premium"
+)
+_CATALOG_TTL_SECONDS = 300
+_catalog_cache = {"at": 0.0, "items": None}
+
+
+def invalidate_catalog_cache():
+    _catalog_cache["at"] = 0.0
+    _catalog_cache["items"] = None
+
+
+def _get_catalog(db):
+    """Non-premium problems as lightweight tuples (cached; column-only query)."""
+    now = time.monotonic()
+    if (
+        not is_testing
+        and _catalog_cache["items"] is not None
+        and now - _catalog_cache["at"] < _CATALOG_TTL_SECONDS
+    ):
+        return _catalog_cache["items"]
+    rows = (
+        db.query(
+            Problem.id, Problem.title, Problem.url, Problem.difficulty,
+            Problem.topics, Problem.companies, Problem.is_premium,
+        )
+        .filter(Problem.is_premium == False, Problem.id.notin_(KNOWN_PREMIUM_SLUGS))  # noqa: E712
+        .all()
+    )
+    items = [_CatalogProblem(*r) for r in rows]
+    if not is_testing:
+        _catalog_cache["items"] = items
+        _catalog_cache["at"] = now
+    return items
+
 
 # ---------------------------------------------------------------------------
 # Canonical Topic Map & Normalization Helper
@@ -409,14 +455,13 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
         SpacedRepetition.stage < 5,
     ).all()
 
+    catalog = _get_catalog(db)
+    catalog_by_id = {p.id: p for p in catalog}
+
     reviews = []
     due_problem_ids = set()
     for r in reviews_due:
-        prob = db.query(Problem).filter(
-            Problem.id == r.problem_id,
-            Problem.is_premium == False,
-            Problem.id.notin_(KNOWN_PREMIUM_SLUGS)
-        ).first()
+        prob = catalog_by_id.get(r.problem_id)
         if prob:
             reviews.append({
                 "problem_id": prob.id,
@@ -435,17 +480,26 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
     reviews = reviews[:10]
 
     # 2. Build base problem pool (strictly non-premium — Tier 1.1)
-    def _pool_query():
-        q = db.query(Problem).filter(
-            Problem.is_premium == False,
-            Problem.id.notin_(KNOWN_PREMIUM_SLUGS)
-        )
-        if company:
-            q = q.filter(Problem.companies.like(f"%{company}%"))
-        return q.all()
-
-    base_pool = _pool_query()
+    if company:
+        _c = company.lower()
+        base_pool = [p for p in catalog if _c in (p.companies or "").lower()]
+    else:
+        base_pool = catalog
     base_pool_ids = {p.id for p in base_pool}
+    base_pool_by_id = {p.id: p for p in base_pool}
+
+    # All of this user's attempts in ONE query (newest first); every per-topic
+    # lookup below is then an in-memory filter instead of another round trip.
+    user_attempts = (
+        db.query(Attempt.problem_id, Attempt.verdict, Attempt.root_cause_category, Attempt.timestamp)
+        .filter(Attempt.user_id == user_id)
+        .order_by(desc(Attempt.timestamp))
+        .all()
+    )
+    accepted_map = {}
+    for a in user_attempts:
+        if a.verdict == "Accepted" and a.problem_id not in accepted_map:
+            accepted_map[a.problem_id] = a.timestamp
 
     # 3. Build a prioritized list of topics (this user's mastery)
     masteries = db.query(TopicMastery).filter(TopicMastery.user_id == user_id).all()
@@ -537,15 +591,8 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
         topic_problems = filter_problems_for_topic(topic_problems, topic)
         topic_prob_ids = [p.id for p in topic_problems]
         
-        recent_attempts = []
-        if topic_prob_ids:
-            recent_attempts = (
-                db.query(Attempt)
-                .filter(Attempt.user_id == user_id, Attempt.problem_id.in_(topic_prob_ids))
-                .order_by(desc(Attempt.timestamp))
-                .limit(3)
-                .all()
-            )
+        topic_id_set = set(topic_prob_ids)
+        recent_attempts = [a for a in user_attempts if a.problem_id in topic_id_set][:3]
 
         if len(recent_attempts) >= 2:
             last_verdicts = [a.verdict for a in recent_attempts[:2]]
@@ -586,7 +633,7 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
                 # 1. Retry failed problem first if any
                 added = False
                 if recent_attempts and recent_attempts[0].verdict != "Accepted":
-                    failed_prob = db.query(Problem).filter(Problem.id == recent_attempts[0].problem_id).first()
+                    failed_prob = base_pool_by_id.get(recent_attempts[0].problem_id)
                     if failed_prob and failed_prob.id in base_pool_ids:
                         if add_recommendation(
                             failed_prob,
@@ -630,7 +677,7 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
         # Retry failed problem
         added_for_topic = False
         if recent_attempts and recent_attempts[0].verdict != "Accepted":
-            failed_prob = db.query(Problem).filter(Problem.id == recent_attempts[0].problem_id).first()
+            failed_prob = base_pool_by_id.get(recent_attempts[0].problem_id)
             if failed_prob and failed_prob.id in base_pool_ids:
                 if add_recommendation(
                     failed_prob,
@@ -641,19 +688,6 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
         if not added_for_topic:
             fourteen_days_ago = get_utc_now() - timedelta(days=14)
             problems = [p for p in topic_problems if p.difficulty == target_diff]
-
-            # Batch query accepted attempts for these problems to avoid N queries in sort
-            p_ids = [p.id for p in problems]
-            accepted_map = {}
-            if p_ids:
-                acc_records = (
-                    db.query(Attempt.problem_id, Attempt.timestamp)
-                    .filter(Attempt.user_id == user_id, Attempt.problem_id.in_(p_ids), Attempt.verdict == "Accepted")
-                    .all()
-                )
-                for pid, ts in acc_records:
-                    if pid not in accepted_map or (ts and accepted_map[pid] and ts > accepted_map[pid]):
-                        accepted_map[pid] = ts
 
             def _solve_recency_score(prob):
                 last_ts = accepted_map.get(prob.id)
@@ -678,11 +712,7 @@ def get_next_problem(db: Session, user_id: int, focus_topic=None, company: str =
 
     # Pass D: If company filter was applied and still fewer than 3 recommendations, fallback to all non-premium problems prioritized by focus/weak topics
     if len(recommendations) < 3 and company:
-        all_non_prem = db.query(Problem).filter(
-            Problem.is_premium == False,
-            Problem.id.notin_(KNOWN_PREMIUM_SLUGS)
-        ).all()
-        all_non_prem_map = {p.id: p for p in all_non_prem}
+        all_non_prem = catalog
         
         # Try focus topics first
         for topic_record in prioritized_topics:
