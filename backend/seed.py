@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import urllib.request
 from backend.database import SessionLocal, engine, Base
@@ -2683,6 +2684,122 @@ def parse_company_csv(csv_data):
         })
     return questions
 
+def infer_topic(slug, title):
+    text = (slug + " " + title).lower()
+    if any(w in text for w in ["tree", "bst", "trie", "inorder", "preorder", "postorder", "subtree", "ancestor", "path sum"]):
+        return "Trees"
+    if any(w in text for w in ["graph", "island", "course-schedule", "network", "clone-graph", "alien", "dijkstra", "bipartite", "cheapest-flight", "swim", "ladder", "provinces", "rotting", "surrounded"]):
+        return "Graphs"
+    if any(w in text for w in ["dynamic-programming", "coin-change", "climbing-stairs", "house-robber", "longest-increasing", "knapsack", "edit-distance", "decode-ways", "partition", "target-sum", "jump-game", "unique-paths", "maximal", "interleaving", "fibonacci", "longest-common", "regex", "burst", "stock", "word-break"]):
+        return "Dynamic Programming"
+    if any(w in text for w in ["backtrack", "n-queens", "sudoku", "permutation", "combination", "subset", "generate-parentheses", "word-search", "palindrome-partitioning", "letter-combinations"]):
+        return "Backtracking"
+    if any(w in text for w in ["linked-list", "reverse-list", "merge-two-sorted-lists", "remove-nth", "reorder-list", "copy-list", "add-two-numbers", "lru", "lfu", "middle-of-the-linked-list", "delete-node", "swap-nodes", "flatten", "intersection-of-two-linked-lists", "rotate-list"]):
+        return "Linked List"
+    if any(w in text for w in ["stack", "parentheses", "evaluate-reverse", "daily-temperatures", "car-fleet", "largest-rectangle", "min-stack", "asteroid", "decode-string", "next-greater"]):
+        return "Stack"
+    if any(w in text for w in ["binary-search", "search-in-rotated", "find-minimum-in-rotated", "search-a-2d", "koko-eating", "time-based", "median-of-two", "first-bad", "peak", "capacity-to-ship"]):
+        return "Binary Search"
+    if any(w in text for w in ["sliding-window", "minimum-window", "longest-substring", "permutation-in-string", "sliding-window-maximum", "longest-repeating", "fruit-into-baskets", "max-consecutive"]):
+        return "Sliding Window"
+    if any(w in text for w in ["heap", "priority-queue", "kth-largest", "top-k", "merge-k-sorted", "find-median-from-data", "task-scheduler", "k-closest", "reorganize-string"]):
+        return "Heap / Priority Queue"
+    if any(w in text for w in ["two-pointers", "3sum", "container-with-most-water", "trapping-rain-water", "valid-palindrome", "two-sum-ii", "remove-duplicates", "move-zeroes", "sort-colors", "4sum"]):
+        return "Two Pointers"
+    if any(w in text for w in ["intervals", "merge-intervals", "insert-interval", "non-overlapping", "meeting-rooms", "erase-overlap", "interval-list"]):
+        return "Intervals"
+    if any(w in text for w in ["greedy", "gas-station", "hand-of-straights", "partition-labels", "valid-parenthesis-string", "candy", "lemonade", "assign-cookies"]):
+        return "Greedy"
+    if any(w in text for w in ["bit", "single-number", "number-of-1-bits", "counting-bits", "reverse-bits", "missing-number", "sum-of-two-integers", "bitwise", "xor"]):
+        return "Bit Manipulation"
+    if any(w in text for w in ["math", "geometry", "rotate-image", "spiral-matrix", "set-matrix-zeroes", "happy-number", "plus-one", "pow", "multiply-strings", "detect-squares"]):
+        return "Math & Geometry"
+    if any(w in text for w in ["string", "anagram", "palindrome", "roman", "integer-to-roman", "zigzag", "group-anagrams"]):
+        return "Strings"
+    return "Arrays"
+
+
+COMPANY_DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "company_problems.json")
+
+
+def load_company_dataset(path=None):
+    """Load the bundled company -> problems dataset (built by
+    scripts/build_company_dataset.py). Returns None if it isn't present."""
+    path = path or COMPANY_DATASET_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("problems"), dict) and isinstance(data.get("companies"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def apply_company_dataset(db, dataset=None):
+    """Idempotently merge the bundled company dataset into the shared catalog.
+
+    - inserts problems that are missing (topic inferred from the slug/title)
+    - adds company tags to existing problems (never removes existing tags)
+    - registers company names in CompanyMetadata (existing focus notes are kept)
+
+    Cheap enough to run on every boot (one pass over the catalog) and needs no
+    network, so it also upgrades databases that were seeded before this dataset existed.
+    Returns (problems_inserted, problems_tagged, companies_added).
+    """
+    dataset = dataset if dataset is not None else load_company_dataset()
+    if not dataset:
+        return (0, 0, 0)
+
+    wanted = {}  # slug -> set(company)
+    for company, slugs in dataset["companies"].items():
+        for slug in slugs:
+            wanted.setdefault(slug, set()).add(company)
+
+    existing_companies = {name for (name,) in db.query(CompanyMetadata.name).all()}
+    companies_added = 0
+    for company in dataset["companies"]:
+        if company not in existing_companies:
+            db.add(CompanyMetadata(name=company, focus_note=None))
+            companies_added += 1
+
+    catalog = {p.id: p for p in db.query(Problem).all()}
+    inserted = tagged = 0
+    for slug, comps in wanted.items():
+        prob = catalog.get(slug)
+        if prob is not None:
+            have = {c.strip() for c in (prob.companies or "").split(",") if c.strip()}
+            merged = have | comps
+            if merged != have:
+                prob.companies = ",".join(sorted(merged))
+                tagged += 1
+            continue
+        title, difficulty = dataset["problems"].get(slug, [slug, "Medium"])
+        db.add(Problem(
+            id=slug,
+            title=title,
+            url=f"https://leetcode.com/problems/{slug}/",
+            difficulty=difficulty if difficulty in ("Easy", "Medium", "Hard") else "Medium",
+            topics=infer_topic(slug, title),
+            companies=",".join(sorted(comps)),
+            is_premium=False,
+        ))
+        inserted += 1
+    db.commit()
+    return (inserted, tagged, companies_added)
+
+
+def _apply_company_dataset_logged(db):
+    if os.getenv("SEED_SKIP_COMPANY_DATASET", "").lower() in ("1", "true", "yes"):
+        return
+    try:
+        inserted, tagged, added = apply_company_dataset(db)
+        print(f"Company dataset: +{inserted} problems, {tagged} re-tagged, +{added} companies.")
+    except Exception as e:
+        db.rollback()
+        print(f"Company dataset step failed (non-fatal): {e}")
+
+
 def seed_db(skip_github: bool = False):
     """Seed the shared problem catalog + company metadata (idempotent, non-destructive).
 
@@ -2709,7 +2826,8 @@ def seed_db(skip_github: bool = False):
         skip_net = os.getenv("SEED_SKIP_GITHUB", "").lower() in ("1", "true", "yes") or skip_github
         threshold = 300 if skip_net else 1000
         if len(existing_problem_ids) >= threshold and not forced:
-            print(f"Catalog already seeded ({len(existing_problem_ids)} problems); skipping.")
+            print(f"Catalog already seeded ({len(existing_problem_ids)} problems); skipping base seed.")
+            _apply_company_dataset_logged(db)
             return
 
         # 1. Parse base problems from the 14-topic JSON data structure
@@ -2797,40 +2915,6 @@ def seed_db(skip_github: bool = False):
                     if q_data.get('is_premium'):
                         problems_dict[q_slug]["is_premium"] = True
                 else:
-                    def infer_topic(slug, title):
-                        text = (slug + " " + title).lower()
-                        if any(w in text for w in ["tree", "bst", "trie", "inorder", "preorder", "postorder", "subtree", "ancestor", "path sum"]):
-                            return "Trees"
-                        if any(w in text for w in ["graph", "island", "course-schedule", "network", "clone-graph", "alien", "dijkstra", "bipartite", "cheapest-flight", "swim", "ladder", "provinces", "rotting", "surrounded"]):
-                            return "Graphs"
-                        if any(w in text for w in ["dynamic-programming", "coin-change", "climbing-stairs", "house-robber", "longest-increasing", "knapsack", "edit-distance", "decode-ways", "partition", "target-sum", "jump-game", "unique-paths", "maximal", "interleaving", "fibonacci", "longest-common", "regex", "burst", "stock", "word-break"]):
-                            return "Dynamic Programming"
-                        if any(w in text for w in ["backtrack", "n-queens", "sudoku", "permutation", "combination", "subset", "generate-parentheses", "word-search", "palindrome-partitioning", "letter-combinations"]):
-                            return "Backtracking"
-                        if any(w in text for w in ["linked-list", "reverse-list", "merge-two-sorted-lists", "remove-nth", "reorder-list", "copy-list", "add-two-numbers", "lru", "lfu", "middle-of-the-linked-list", "delete-node", "swap-nodes", "flatten", "intersection-of-two-linked-lists", "rotate-list"]):
-                            return "Linked List"
-                        if any(w in text for w in ["stack", "parentheses", "evaluate-reverse", "daily-temperatures", "car-fleet", "largest-rectangle", "min-stack", "asteroid", "decode-string", "next-greater"]):
-                            return "Stack"
-                        if any(w in text for w in ["binary-search", "search-in-rotated", "find-minimum-in-rotated", "search-a-2d", "koko-eating", "time-based", "median-of-two", "first-bad", "peak", "capacity-to-ship"]):
-                            return "Binary Search"
-                        if any(w in text for w in ["sliding-window", "minimum-window", "longest-substring", "permutation-in-string", "sliding-window-maximum", "longest-repeating", "fruit-into-baskets", "max-consecutive"]):
-                            return "Sliding Window"
-                        if any(w in text for w in ["heap", "priority-queue", "kth-largest", "top-k", "merge-k-sorted", "find-median-from-data", "task-scheduler", "k-closest", "reorganize-string"]):
-                            return "Heap / Priority Queue"
-                        if any(w in text for w in ["two-pointers", "3sum", "container-with-most-water", "trapping-rain-water", "valid-palindrome", "two-sum-ii", "remove-duplicates", "move-zeroes", "sort-colors", "4sum"]):
-                            return "Two Pointers"
-                        if any(w in text for w in ["intervals", "merge-intervals", "insert-interval", "non-overlapping", "meeting-rooms", "erase-overlap", "interval-list"]):
-                            return "Intervals"
-                        if any(w in text for w in ["greedy", "gas-station", "hand-of-straights", "partition-labels", "valid-parenthesis-string", "candy", "lemonade", "assign-cookies"]):
-                            return "Greedy"
-                        if any(w in text for w in ["bit", "single-number", "number-of-1-bits", "counting-bits", "reverse-bits", "missing-number", "sum-of-two-integers", "bitwise", "xor"]):
-                            return "Bit Manipulation"
-                        if any(w in text for w in ["math", "geometry", "rotate-image", "spiral-matrix", "set-matrix-zeroes", "happy-number", "plus-one", "pow", "multiply-strings", "detect-squares"]):
-                            return "Math & Geometry"
-                        if any(w in text for w in ["string", "anagram", "palindrome", "roman", "integer-to-roman", "zigzag", "group-anagrams"]):
-                            return "Strings"
-                        return "Arrays"
-
                     inferred = infer_topic(q_slug, q_data['title'])
                     problems_dict[q_slug] = {
                         "id": q_slug,
@@ -2865,6 +2949,7 @@ def seed_db(skip_github: bool = False):
         # for the calling user), so seeding is catalog-only here.
 
         db.commit()
+        _apply_company_dataset_logged(db)
         print("Database seeding completed successfully!")
     except Exception as e:
         db.rollback()

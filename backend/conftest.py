@@ -11,6 +11,9 @@ Tests that must exercise REAL auth (401s, cross-user isolation) opt out with:
 import os
 # Tests seed the catalog offline (bundled fallback lists) — fast and no network.
 os.environ.setdefault("SEED_SKIP_GITHUB", "1")
+# The bundled ~3k-problem company dataset is exercised by its own tests; skipping it
+# here keeps every other test running against the small, predictable base catalog.
+os.environ.setdefault("SEED_SKIP_COMPANY_DATASET", "1")
 
 import pytest
 from datetime import datetime, timezone
