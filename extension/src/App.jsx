@@ -56,6 +56,8 @@ const goTo = (url) => {
 
 const difficultyClass = (d) => String(d || 'medium').toLowerCase();
 
+const CONTACT_EMAIL = 'codecoach.work@gmail.com';
+
 const PANEL_OPEN_KEY = 'dsaTutorPanelOpen';
 const readPanelOpen = () => {
   try { return window.localStorage.getItem(PANEL_OPEN_KEY) !== 'false'; } catch { return true; }
@@ -338,6 +340,21 @@ export default function App() {
   const [weeklyData, setWeeklyData] = useState(null);
   const [loadingWeekly, setLoadingWeekly] = useState(false);
   const [weeklyCopied, setWeeklyCopied] = useState(false);
+  const [contactCopied, setContactCopied] = useState(false);
+
+  // mailto: silently does nothing when no email app is set up (common on
+  // Windows with web Gmail), so always copy the address and confirm it too.
+  const handleContactClick = () => {
+    const done = () => {
+      setContactCopied(true);
+      setTimeout(() => setContactCopied(false), 2500);
+    };
+    try {
+      navigator.clipboard.writeText(CONTACT_EMAIL).then(done, done);
+    } catch {
+      done();
+    }
+  };
 
   const openWeeklyDigest = () => {
     setLoadingWeekly(true);
@@ -2371,7 +2388,14 @@ export default function App() {
           </span>
         )}
         <span className="footer-version">
-          <a className="footer-contact" href="mailto:codecoach.work@gmail.com" title="codecoach.work@gmail.com">Contact</a>
+          <a
+            className="footer-contact"
+            href={`mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('CodeCoach feedback')}`}
+            title={`Email ${CONTACT_EMAIL} (address is copied to your clipboard)`}
+            onClick={handleContactClick}
+          >
+            {contactCopied ? '✓ Email copied' : 'Contact'}
+          </a>
           {EXT_VERSION ? <span>· v{EXT_VERSION}</span> : null}
         </span>
       </div>
