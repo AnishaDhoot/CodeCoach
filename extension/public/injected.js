@@ -184,10 +184,14 @@ const getActiveCodeModel = () => {
 
 const initMonacoListeners = () => {
   if (window.monaco && window.monaco.editor) {
-    (window.monaco.editor.getModels() || []).forEach(captureInitialCodeForModel);
+    (window.monaco.editor.getModels() || []).forEach((model) => {
+      captureInitialCodeForModel(model);
+      watchModelForBadgeTest(model);
+    });
 
     window.monaco.editor.onDidCreateModel((model) => {
       captureInitialCodeForModel(model);
+      watchModelForBadgeTest(model);
     });
 
     window.monaco.editor.onDidCreateEditor((editor) => {
@@ -458,16 +462,23 @@ document.addEventListener("click", (e) => {
 }, true);
 
 // ---------------------------------------------------------------------------
-// Badge Test editor-reset guard.
-// A reset wipes the editor back to LeetCode's starter code. It must only ever
-// happen (a) while a Badge Test is active, (b) on one of that test's two
-// problems, and (c) during a short window after the user first lands on that
-// problem (to beat LeetCode restoring an old saved answer). Outside that window
-// a reset would destroy the user's in-progress test work — e.g. after a Wrong
-// Answer triggers a data refresh — so it is skipped.
+// Badge Test editor control.
+//
+// During a Badge Test the editor must show either the code the user wrote
+// DURING the test, or LeetCode's starter code — never an older answer that
+// LeetCode restores from its own saved state.
+//
+//  * Every keystroke on a test problem is saved to a per-test snapshot
+//    (localStorage, keyed by test id + problem + language).
+//  * Each time the user lands on a test problem (full load or SPA switch),
+//    the editor is set to that snapshot, or to the starter code if there is
+//    none. This is retried for a few seconds to beat LeetCode's hydration.
+//  * Enforcement stops as soon as the user starts typing, or after the
+//    window closes, so later refreshes (e.g. after a Wrong Answer) can never
+//    wipe in-progress work.
 // ---------------------------------------------------------------------------
 const BADGE_CACHE_KEY = 'dsaTutorActiveBadgeTest';
-const RESET_LOG_KEY = 'dsaTutorBadgeResetLog';
+const BADGE_CODE_KEY = 'dsaTutorBadgeCode';
 const RESET_WINDOW_MS = 6000;
 
 const currentProblemSlug = () => {
@@ -495,31 +506,98 @@ const readActiveBadgeTest = () => {
   }
 };
 
-const badgeResetAllowed = () => {
+// { test, slug } when the current page is one of the active test's problems.
+const activeTestProblem = () => {
   const test = readActiveBadgeTest();
-  const slug = currentProblemSlug();
-  if (!test || !slug) return false;
-  if (slug !== slugOfProblem(test.problem1) && slug !== slugOfProblem(test.problem2)) return false;
-  try {
-    const key = `${test.id}:${slug}`;
-    const log = JSON.parse(window.localStorage.getItem(RESET_LOG_KEY) || '{}');
-    if (log.testId !== test.id) {
-      log.testId = test.id;
-      log.first = {};
-    }
-    log.first = log.first || {};
-    const now = Date.now();
-    if (!log.first[key]) {
-      log.first[key] = now;
-      window.localStorage.setItem(RESET_LOG_KEY, JSON.stringify(log));
-      return true;
-    }
-    return now - log.first[key] < RESET_WINDOW_MS;
-  } catch {
-    return true;
+  if (!test) {
+    try { window.localStorage.removeItem(BADGE_CODE_KEY); } catch { /* ignore */ }
+    return null;
   }
+  const slug = currentProblemSlug();
+  if (!slug) return null;
+  if (slug !== slugOfProblem(test.problem1) && slug !== slugOfProblem(test.problem2)) return null;
+  return { test, slug };
+};
+
+const readBadgeCodeStore = (testId) => {
+  try {
+    const store = JSON.parse(window.localStorage.getItem(BADGE_CODE_KEY) || 'null');
+    if (store && store.testId === testId && store.codes) return store;
+  } catch { /* ignore */ }
+  return { testId, codes: {} };
+};
+
+const saveBadgeTestCode = (testId, slug, lang, code) => {
+  const store = readBadgeCodeStore(testId);
+  store.codes[`${slug}:${lang}`] = code;
+  try { window.localStorage.setItem(BADGE_CODE_KEY, JSON.stringify(store)); } catch { /* ignore */ }
+};
+
+const getBadgeTestCode = (testId, slug, lang) => readBadgeCodeStore(testId).codes[`${slug}:${lang}`];
+
+const modelLangOf = (model) => ((model && model.getLanguageId ? model.getLanguageId() : '') || '').toLowerCase();
+
+// Tracks the current "visit" to a problem page. LeetCode is a SPA, so a visit
+// starts on page load and again whenever the problem slug in the URL changes.
+let badgeVisit = { slug: currentProblemSlug(), startedAt: Date.now(), userEdited: false };
+
+const scheduleBadgeEditorSync = () => {
+  [150, 500, 1000, 1800, 3000, 4500].forEach((d) =>
+    setTimeout(() => window.postMessage({ type: 'RESET_EDITOR' }, window.location.origin), d)
+  );
+};
+
+const trackBadgeVisit = () => {
+  const slug = currentProblemSlug();
+  if (slug === badgeVisit.slug) return;
+  badgeVisit = { slug, startedAt: Date.now(), userEdited: false };
+  if (activeTestProblem()) scheduleBadgeEditorSync();
+};
+setInterval(trackBadgeVisit, 300);
+
+const badgeResetAllowed = () => {
+  if (!activeTestProblem()) return false;
+  trackBadgeVisit();
+  return !badgeVisit.userEdited && Date.now() - badgeVisit.startedAt < RESET_WINDOW_MS;
 };
 window.__dsaBadgeResetAllowed = badgeResetAllowed;
+
+// Save what the user types during a test. Programmatic replacements (our own
+// setValue, or LeetCode restoring saved code) are ignored so an old answer
+// can never become the snapshot.
+const watchedBadgeModels = new WeakSet();
+const watchModelForBadgeTest = (model) => {
+  if (!model || !model.onDidChangeContent || watchedBadgeModels.has(model)) return;
+  watchedBadgeModels.add(model);
+  model.onDidChangeContent((e) => {
+    try {
+      if (!e || e.isFlush) return;
+      const changes = e.changes || [];
+      if (changes.length === 1) {
+        const c = changes[0];
+        const prevLength = model.getValueLength() - (c.text || '').length + (c.rangeLength || 0);
+        if (prevLength > 0 && c.rangeLength === prevLength) return; // whole-document replace
+      }
+      const ctx = activeTestProblem();
+      if (!ctx || model !== getActiveCodeModel()) return;
+      if (badgeVisit.slug === ctx.slug) badgeVisit.userEdited = true;
+      saveBadgeTestCode(ctx.test.id, ctx.slug, modelLangOf(model), model.getValue());
+    } catch { /* never break the editor */ }
+  });
+};
+
+// Put the right code in the editor for this test problem: the user's own
+// in-test snapshot if there is one. Returns true if handled.
+const applySavedBadgeCode = () => {
+  const ctx = activeTestProblem();
+  const model = getActiveCodeModel();
+  if (!ctx || !model) return false;
+  const saved = getBadgeTestCode(ctx.test.id, ctx.slug, modelLangOf(model));
+  if (typeof saved !== 'string') return false;
+  if (model.getValue() !== saved) model.setValue(saved);
+  if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
+  return true;
+};
 
 // LeetCode's language slugs don't match Monaco's language ids one-to-one.
 const MONACO_TO_LEETCODE_LANG = {
@@ -604,6 +682,9 @@ window.addEventListener("message", (event) => {
 
       const fetchStarterSnippetAndApply = async () => {
         try {
+          // Returning to a test problem: restore the user's in-test code.
+          if (applySavedBadgeCode()) return true;
+
           const slugMatch = window.location.pathname.match(/problems\/([^/]+)/);
           const titleSlug = slugMatch ? slugMatch[1] : '';
           if (!titleSlug) return false;
@@ -647,9 +728,10 @@ window.addEventListener("message", (event) => {
           const match = pickStarterSnippet(snippets, modelLang);
 
           if (match && match.code) {
-            bestModel.setValue(match.code);
+            // Setting the model directly opens no dialog, so don't go
+            // clicking confirm-looking buttons on the page afterwards.
+            if (bestModel.getValue() !== match.code) bestModel.setValue(match.code);
             if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
-            [20, 80, 200, 500, 1000].forEach(delay => setTimeout(tryConfirmModal, delay));
             return true;
           }
         } catch (e) {
@@ -677,6 +759,9 @@ window.addEventListener("message", (event) => {
       let resetTriggerClicked = false;
 
       const fallbackToSnapshot = () => {
+        // The "initial" model content is whatever LeetCode loaded — during a
+        // Badge Test that can be an old answer, so never fall back to it there.
+        if (activeTestProblem()) return;
         try {
           const bestModel = getActiveCodeModel();
           if (bestModel) {
@@ -848,11 +933,7 @@ window.addEventListener("message", (event) => {
       const startResetFlow = async () => {
         debugReset('Attempting instant GraphQL starter snippet reset');
         const fetched = await fetchStarterSnippetAndApply();
-        if (fetched) {
-          debugReset('Instant GraphQL starter snippet reset applied successfully');
-          [20, 60, 150, 300, 600, 1000].forEach(delay => setTimeout(dismissLeetcodeDialogs, delay));
-          return;
-        }
+        if (fetched) return;
 
         debugReset('GraphQL snippet reset unavailable, attempting native reset button polling');
         executeReset();
