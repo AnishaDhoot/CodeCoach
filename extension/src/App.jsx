@@ -24,7 +24,7 @@ const readCachedActiveTest = () => {
     const elapsed = (c.data.elapsed_seconds || 0) + (Date.now() - c.cachedAt) / 1000;
     if (elapsed >= limit) return null;
     return { data: c.data, remaining: Math.floor(limit - elapsed) };
-  } catch (e) {
+  } catch {
     return null;
   }
 };
@@ -36,8 +36,34 @@ const writeCachedActiveTest = (data) => {
     } else {
       window.localStorage.removeItem(ACTIVE_TEST_CACHE_KEY);
     }
-  } catch (e) { /* storage unavailable */ }
+  } catch { /* storage unavailable */ }
 };
+
+// Only follow links that point at LeetCode itself (backend data is not trusted
+// to contain javascript:/external URLs).
+const safeLeetCodeUrl = (url) => {
+  try {
+    const u = new URL(url, 'https://leetcode.com');
+    if (u.protocol === 'https:' && (u.hostname === 'leetcode.com' || u.hostname.endsWith('.leetcode.com'))) return u.href;
+  } catch { /* invalid URL */ }
+  return null;
+};
+
+const goTo = (url) => {
+  const safe = safeLeetCodeUrl(url);
+  if (safe) window.location.href = safe;
+};
+
+const difficultyClass = (d) => String(d || 'medium').toLowerCase();
+
+const PANEL_OPEN_KEY = 'dsaTutorPanelOpen';
+const readPanelOpen = () => {
+  try { return window.localStorage.getItem(PANEL_OPEN_KEY) !== 'false'; } catch { return true; }
+};
+
+const EXT_VERSION = (() => {
+  try { return chrome.runtime.getManifest().version; } catch { return ''; }
+})();
 
 const slugOf = (p) => {
   if (!p) return '';
@@ -47,14 +73,17 @@ const slugOf = (p) => {
 
 export default function App() {
   const isContestMode = typeof window !== 'undefined' && (window.location.href.includes('/contest/') || window.location.pathname.startsWith('/contest'));
-  const [autoOpenedReviews, setAutoOpenedReviews] = useState(false);
-
-  const [isOpen, setIsOpen] = useState(true);
+  const [isOpen, setIsOpenState] = useState(readPanelOpen);
+  // Remember whether the user collapsed the panel so it doesn't pop open
+  // over the editor on every page load.
+  const setIsOpen = (open) => {
+    setIsOpenState(open);
+    try { window.localStorage.setItem(PANEL_OPEN_KEY, open ? 'true' : 'false'); } catch { /* storage unavailable */ }
+  };
   const [activeTab, setActiveTab] = useState('coach');
   const [masteryData, setMasteryData] = useState([]);
   const [recommendation, setRecommendation] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [diagnosis, setDiagnosis] = useState(null);
   const [error, setError] = useState(null);
 
   const refreshTimerRef = useRef(null);
@@ -77,13 +106,13 @@ export default function App() {
   const [activeTest, setActiveTest] = useState(cachedTestRef.current ? cachedTestRef.current.data : null);
   const [testTimerSeconds, setTestTimerSeconds] = useState(cachedTestRef.current ? cachedTestRef.current.remaining : 5400); // 1.5 hours default
   const [badgeAwardModal, setBadgeAwardModal] = useState(null);
+  const hasActiveTest = !!activeTest;
 
   // Code Coach states (persistent per tool)
   const [approachResult, setApproachResult] = useState(null);
   const [edgeResult, setEdgeResult] = useState(null);
   const [askResults, setAskResults] = useState([]);
   const [diagnosisResult, setDiagnosisResult] = useState(null);
-  const [companyMetadata, setCompanyMetadata] = useState({});
 
   const getBadgeEmoji = (badge) => {
     switch (badge) {
@@ -111,7 +140,9 @@ export default function App() {
     return out;
   };
 
-  const fetchActiveTest = (retriesLeft = 4) => {
+  // resetEditor=true only on page load: wiping the editor on later refreshes
+  // (e.g. after a Wrong Answer) would destroy the user's in-progress work.
+  const fetchActiveTest = (retriesLeft = 4, { resetEditor = false } = {}) => {
     chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
       if (res && res.success) {
         // Backend responded authoritatively.
@@ -124,7 +155,7 @@ export default function App() {
           if (window.dsaTutor?.setAssessmentLocked) {
             window.dsaTutor.setAssessmentLocked(true, 'Badge Test');
           }
-          if (window.dsaTutor?.resetEditor) {
+          if (resetEditor && window.dsaTutor?.resetEditor) {
             window.dsaTutor.resetEditor();
             [200, 600, 1200, 2200].forEach(d => {
               setTimeout(() => {
@@ -136,12 +167,12 @@ export default function App() {
           // Confirmed: no active test (also clears any stale cached test).
           setActiveTest(null);
           writeCachedActiveTest(null);
-          window.postMessage({ type: 'REVEAL_EDITOR' }, '*');
+          window.postMessage({ type: 'REVEAL_EDITOR' }, window.location.origin);
         }
       } else if (retriesLeft > 0) {
         // Transient failure (e.g. cold/free backend, timeout). Do NOT wipe the
         // badge-test UI — retry so an in-progress test survives a page reload.
-        setTimeout(() => fetchActiveTest(retriesLeft - 1), 2000);
+        setTimeout(() => fetchActiveTest(retriesLeft - 1, { resetEditor }), 2000);
       }
     });
   };
@@ -149,6 +180,9 @@ export default function App() {
   const startBadgeTest = (topic) => {
     chrome.runtime.sendMessage({ action: 'start_badge_test', payload: { topic } }, (res) => {
       if (res && res.success && res.data) {
+        // Persist immediately (not just in the effect) so the next page can
+        // see the test even if we navigate away before React commits.
+        writeCachedActiveTest(res.data);
         setActiveTest(res.data);
         setTestTimerSeconds(res.data.time_limit_seconds || 5400);
         setActiveTab('test');
@@ -164,10 +198,10 @@ export default function App() {
           });
         }
         if (res.data.problem1?.url) {
-          const urlMatch = window.location.href.match(/problems\/([^/]+)/);
-          const currentSlug = urlMatch ? urlMatch[1] : '';
-          if (currentSlug !== res.data.problem1.id) {
-            window.location.href = res.data.problem1.url;
+          const urlMatch = window.location.href.match(/problems\/([^/?#]+)/);
+          const currentSlug = urlMatch ? urlMatch[1].toLowerCase() : '';
+          if (currentSlug !== slugOf(res.data.problem1)) {
+            goTo(res.data.problem1.url);
           }
         }
       } else {
@@ -177,23 +211,10 @@ export default function App() {
   };
 
   const [showBadgeSubmitConfirm, setShowBadgeSubmitConfirm] = useState(false);
-  const [resetFeedback, setResetFeedback] = useState(false);
-
-  const handleManualResetEditor = () => {
-    if (window.dsaTutor?.resetEditor) {
-      window.dsaTutor.resetEditor();
-      [150, 400, 900, 1800].forEach(d => {
-        setTimeout(() => {
-          if (window.dsaTutor?.resetEditor) window.dsaTutor.resetEditor();
-        }, d);
-      });
-    }
-    setResetFeedback(true);
-    setTimeout(() => setResetFeedback(false), 2200);
-  };
 
   const abandonBadgeTest = () => {
     if (window.confirm && !window.confirm('Are you sure you want to abandon this Badge Test? All progress for this test will be lost.')) return;
+    writeCachedActiveTest(null);
     setActiveTest(null);
     setActiveTab('mastery');
     if (window.dsaTutor?.setAssessmentLocked) {
@@ -219,6 +240,7 @@ export default function App() {
         } else {
           alert(res.data?.message || 'Badge Test submitted. Both problems must be solved to earn the badge.');
         }
+        writeCachedActiveTest(null);
         setActiveTest(null);
         setActiveTab('mastery');
         fetchMastery();
@@ -267,10 +289,6 @@ export default function App() {
   const [companies, setCompanies] = useState([]);
   const [selectedCompany, setSelectedCompany] = useState('');
   const [weakPairs, setWeakPairs] = useState([]);
-  const [estimateTime, setEstimateTime] = useState('O(N)');
-  const [estimateSpace, setEstimateSpace] = useState('O(1)');
-  const [showEstimateForm, setShowEstimateForm] = useState(false);
-  const [estimateSubmitted, setEstimateSubmitted] = useState(false);
   const [showExplainBack, setShowExplainBack] = useState(false);
   const [userExplanationInput, setUserExplanationInput] = useState('');
   const [explainBackResult, setExplainBackResult] = useState(null);
@@ -284,12 +302,6 @@ export default function App() {
   const fetchCompanies = () => {
     chrome.runtime.sendMessage({ action: 'get_companies' }, (res) => {
       if (res && res.success) setCompanies(res.data || []);
-    });
-  };
-
-  const fetchCompanyMetadata = () => {
-    chrome.runtime.sendMessage({ action: 'get_company_metadata' }, (res) => {
-      if (res && res.success) setCompanyMetadata(res.data || {});
     });
   };
 
@@ -312,44 +324,12 @@ export default function App() {
 
   // Solved Problems Table States & Filters
   const [solvedProblems, setSolvedProblems] = useState([]);
-  const [loadingSolved, setLoadingSolved] = useState(false);
-  const [solvedSearch, setSolvedSearch] = useState('');
-  const [solvedDifficultyFilter, setSolvedDifficultyFilter] = useState('ALL');
-  const [solvedTopicFilter, setSolvedTopicFilter] = useState('ALL');
-  const [inlineNotes, setInlineNotes] = useState({});
-  const [inlineDiffs, setInlineDiffs] = useState({});
-  const [inlineSaveStatus, setInlineSaveStatus] = useState({});
 
   const fetchSolvedProblems = () => {
-    setLoadingSolved(true);
     chrome.runtime.sendMessage({ action: 'get_solved_problems' }, (res) => {
-      setLoadingSolved(false);
       if (res && res.success && Array.isArray(res.data)) {
         setSolvedProblems(res.data);
-        const notesMap = {};
-        const diffsMap = {};
-        res.data.forEach(p => {
-          notesMap[p.problem_id] = p.user_notes || '';
-          diffsMap[p.problem_id] = p.personal_difficulty || '';
-        });
-        setInlineNotes(notesMap);
-        setInlineDiffs(diffsMap);
       }
-    });
-  };
-
-  const saveInlineNote = (problemId, notes, diff, problemTitle) => {
-    const payload = {
-      problem_id: problemId,
-      problem_title: problemTitle || problemId,
-      user_notes: notes !== undefined ? notes : (inlineNotes[problemId] || ''),
-      personal_difficulty: diff !== undefined ? diff : (inlineDiffs[problemId] || '')
-    };
-    chrome.runtime.sendMessage({ action: 'save_problem_notes', payload }, (res) => {
-      setInlineSaveStatus(prev => ({ ...prev, [problemId]: true }));
-      setTimeout(() => {
-        setInlineSaveStatus(prev => ({ ...prev, [problemId]: false }));
-      }, 2000);
     });
   };
 
@@ -371,11 +351,13 @@ export default function App() {
   };
 
   const copyWeeklyMarkdown = () => {
-    if (weeklyData?.markdown_text) {
-      navigator.clipboard.writeText(weeklyData.markdown_text);
-      setWeeklyCopied(true);
-      setTimeout(() => setWeeklyCopied(false), 2500);
-    }
+    if (!weeklyData?.markdown_text || !navigator.clipboard) return;
+    navigator.clipboard.writeText(weeklyData.markdown_text)
+      .then(() => {
+        setWeeklyCopied(true);
+        setTimeout(() => setWeeklyCopied(false), 2500);
+      })
+      .catch(() => alert('Could not copy to clipboard. Use "Download .md" instead.'));
   };
 
   // CSV Export state
@@ -386,6 +368,7 @@ export default function App() {
   const [userNotesInput, setUserNotesInput] = useState('');
   const [personalDifficultyInput, setPersonalDifficultyInput] = useState('');
   const [savingNotesStatus, setSavingNotesStatus] = useState(false);
+  const notesSaveTimerRef = useRef(null);
 
   const fetchProblemDetails = (probId) => {
     if (!probId) return;
@@ -397,7 +380,13 @@ export default function App() {
     });
   };
 
-  const saveNotes = (notes, diff) => {
+  // Debounced: typing in the notes box shouldn't fire one request per keystroke.
+  const saveNotes = (notes, diff, { immediate = false } = {}) => {
+    if (notesSaveTimerRef.current) clearTimeout(notesSaveTimerRef.current);
+    if (!immediate) {
+      notesSaveTimerRef.current = setTimeout(() => saveNotes(notes, diff, { immediate: true }), 700);
+      return;
+    }
     const identity = window.dsaTutor?.getIdentity ? window.dsaTutor.getIdentity() : null;
     const probId = identity?.problemId || currentProblemId;
     if (!probId) return;
@@ -407,22 +396,26 @@ export default function App() {
       user_notes: notes,
       personal_difficulty: diff
     };
-    chrome.runtime.sendMessage({ action: 'save_problem_notes', payload }, () => {
-      setSavingNotesStatus(true);
-      setTimeout(() => setSavingNotesStatus(false), 2000);
+    chrome.runtime.sendMessage({ action: 'save_problem_notes', payload }, (res) => {
+      if (res && res.success) {
+        setSavingNotesStatus(true);
+        setTimeout(() => setSavingNotesStatus(false), 2000);
+      }
     });
   };
 
   const exportWeeklyJournal = () => {
     chrome.runtime.sendMessage({ action: 'get_weekly_journal' }, (res) => {
-      if (res && res.success && res.data.markdown_text) {
+      if (res && res.success && res.data?.markdown_text) {
         const blob = new Blob([res.data.markdown_text], { type: 'text/markdown' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `weekly_dsa_digest_${res.data.period_end}.md`;
+        a.download = `weekly_dsa_digest_${res.data.period_end || 'latest'}.md`;
         a.click();
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } else {
+        alert(res?.error || 'Failed to download the weekly log.');
       }
     });
   };
@@ -441,7 +434,7 @@ export default function App() {
         const today = new Date().toISOString().slice(0, 10);
         a.download = `dsa_solved_problems_${csvTimeframe}_${today}.csv`;
         a.click();
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
       } else {
         alert(res?.error || 'Failed to export CSV.');
       }
@@ -467,43 +460,11 @@ export default function App() {
         fetchAiQuota();
         if (res && res.success) {
           setExplainBackResult(res.data);
+        } else {
+          setCoachError(res?.error || 'Could not verify your explanation.');
         }
       });
     } catch (e) {
-      console.warn('Explain back failed:', e);
-    }
-  };
-
-  const runComplexityWithEstimate = async () => {
-    if (isContestMode) {
-      setCoachError('AI assistance is disabled during LeetCode contests to comply with fair play rules.');
-      return;
-    }
-    if (!estimateSubmitted) {
-      setShowEstimateForm(true);
-      return;
-    }
-    setCoachError(null);
-    setCoachLoading('approach');
-    try {
-      const ctx = await gatherContext(true);
-      const estPayload = { problem_id: ctx.problem_id, time_complexity: estimateTime, space_complexity: estimateSpace, is_contest: isContestMode };
-      chrome.runtime.sendMessage({ action: 'critique_estimate', payload: estPayload }, () => {
-        chrome.runtime.sendMessage({ action: 'critique_reveal', payload: ctx }, (response) => {
-          setCoachLoading(null);
-          fetchAiQuota();
-          if (response && response.success) {
-            setApproachResult(response.data);
-            setCoachFilter('approach');
-            setIsOpen(true);
-            setActiveTab('coach');
-          } else {
-            setCoachError(response?.error || 'Request failed.');
-          }
-        });
-      });
-    } catch (e) {
-      setCoachLoading(null);
       setCoachError(e.message || String(e));
     }
   };
@@ -728,8 +689,6 @@ export default function App() {
     setDiagnosisResult(null);
     setHintsList([]);
     setCurrentHintLevel(0);
-    setShowEstimateForm(false);
-    setEstimateSubmitted(false);
     setUserExplanationInput('');
     setExplainBackResult(null);
     setShowExplainBack(false);
@@ -761,7 +720,7 @@ export default function App() {
             }
           }
         }
-      } catch (e) {
+      } catch {
         // Ignore
       }
     };
@@ -800,32 +759,33 @@ export default function App() {
 
   // Active Badge Test countdown timer
   useEffect(() => {
-    if (!activeTest) return;
+    if (!hasActiveTest) return;
     const t = setInterval(() => {
-      setTestTimerSeconds(prev => {
-        if (prev <= 1) {
-          clearInterval(t);
-          alert('⏱ Badge test time expired!');
-          setActiveTest(null);
-          fetchMastery();
-          return 0;
-        }
-        return prev - 1;
-      });
+      setTestTimerSeconds(prev => (prev <= 1 ? 0 : prev - 1));
     }, 1000);
     return () => clearInterval(t);
-  }, [activeTest]);
+  }, [hasActiveTest, activeTest?.id]);
 
-  // Lock Solutions, Editorial, and Discussion tabs during Badge Tests
+  // Handle expiry outside the state updater (updaters must stay side-effect free).
   useEffect(() => {
-    const isAssessmentActive = !!activeTest;
-    const reason = activeTest ? 'Badge Test' : '';
+    if (!hasActiveTest || testTimerSeconds > 0) return;
+    writeCachedActiveTest(null);
+    setActiveTest(null);
+    fetchMastery();
+    alert('⏱ Badge test time expired!');
+  }, [hasActiveTest, testTimerSeconds]);
+
+  // Lock Solutions, Editorial, and Discussion tabs during Badge Tests.
+  // Depends on whether a test is active (not the test object, which the 2s
+  // poller replaces) so the locks don't flicker off/on every poll.
+  useEffect(() => {
+    const reason = hasActiveTest ? 'Badge Test' : '';
 
     const notifyLock = () => {
       if (window.dsaTutor?.setAssessmentLocked) {
-        window.dsaTutor.setAssessmentLocked(isAssessmentActive, reason);
+        window.dsaTutor.setAssessmentLocked(hasActiveTest, reason);
       }
-      window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked: isAssessmentActive, reason }, '*');
+      window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked: hasActiveTest, reason }, window.location.origin);
     };
 
     notifyLock();
@@ -836,9 +796,9 @@ export default function App() {
       if (window.dsaTutor?.setAssessmentLocked) {
         window.dsaTutor.setAssessmentLocked(false, '');
       }
-      window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked: false, reason: '' }, '*');
+      window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked: false, reason: '' }, window.location.origin);
     };
-  }, [activeTest]);
+  }, [hasActiveTest]);
 
   // Fetch data on mount
   useEffect(() => {
@@ -849,9 +809,8 @@ export default function App() {
     fetchAnalysis();
     fetchStreak();
     fetchCompanies();
-    fetchCompanyMetadata();
     fetchWeakPairs();
-    fetchActiveTest();
+    fetchActiveTest(4, { resetEditor: true });
     fetchAiQuota();
     fetchSyncedAccount();
     fetchSolvedProblems();
@@ -885,6 +844,7 @@ export default function App() {
       fetchMastery: fetchMastery,
       showBadgeAwardModal: (awardData) => {
         setBadgeAwardModal(awardData);
+        writeCachedActiveTest(null);
         setActiveTest(null);
         setActiveTab('mastery');
         fetchMastery();
@@ -896,13 +856,11 @@ export default function App() {
           if (!activeTest) {
             setActiveTab('coach');
           }
-          setDiagnosis(null);
           setError(null);
         }
       },
       setDiagnosis: (diagResult) => {
         setLoading(false);
-        setDiagnosis(diagResult);
         setIsOpen(true);
         if (!activeTest) {
           setActiveTab('coach');
@@ -929,10 +887,7 @@ export default function App() {
         }
       },
       resetEditor: window.dsaTutor?.resetEditor || (() => {
-        window.postMessage({ type: 'RESET_EDITOR' }, '*');
-        if (window.__dsaTutorResetEditor) {
-          try { window.__dsaTutorResetEditor(); } catch (e) {}
-        }
+        window.postMessage({ type: 'RESET_EDITOR' }, window.location.origin);
       }),
       refreshData: () => {
         scheduleBatchedRefresh();
@@ -942,7 +897,8 @@ export default function App() {
     const handleGlobalKeyDown = (e) => {
       if (e.key === 'Escape') {
         setBadgeAwardModal(null);
-        setShowScorecardModal(false);
+        setShowWeeklyModal(false);
+        setShowBadgeSubmitConfirm(false);
       }
     };
     window.addEventListener('keydown', handleGlobalKeyDown);
@@ -961,12 +917,10 @@ export default function App() {
 
   const fetchMastery = () => {
     chrome.runtime.sendMessage({ action: 'get_mastery' }, (response) => {
-      if (response && response.success) {
+      if (response && response.success && Array.isArray(response.data)) {
         // Sort by lowest mastery score first
         const sortedData = [...response.data].sort((a, b) => a.mastery_score - b.mastery_score);
         setMasteryData(sortedData);
-      } else {
-        console.error('Failed to fetch mastery:', response?.error);
       }
     });
   };
@@ -975,21 +929,19 @@ export default function App() {
     chrome.runtime.sendMessage({ action: 'get_recommendation', payload: { company: comp || null } }, (response) => {
       if (response && response.success) {
         setRecommendation(response.data);
-      } else {
-        console.error('Failed to fetch recommendation:', response?.error);
       }
     });
   };
 
   if (!isOpen) {
     return (
-      <div className="tutor-trigger" onClick={() => setIsOpen(true)} title="Open CodeCoach">
+      <button type="button" className="tutor-trigger" onClick={() => setIsOpen(true)} title="Open CodeCoach" aria-label="Open CodeCoach">
         {/* Bracket mark */}
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5a2 2 0 0 0 2 2h1"/>
           <path d="M16 3h1a2 2 0 0 1 2 2v5a2 2 0 0 0 2 2 2 2 0 0 0-2 2v5a2 2 0 0 1-2 2h-1"/>
         </svg>
-      </div>
+      </button>
     );
   }
 
@@ -1006,14 +958,14 @@ export default function App() {
             </svg>
           </span>
           CodeCoach
-          <span style={{ fontSize: '11px', background: '#27272a', padding: '2px 6px', borderRadius: '10px', color: '#f59e0b', fontWeight: '500' }}>
+          <span className="streak-pill" title="Daily solving streak">
             🔥 {streakData?.current_streak_days || 0}d
           </span>
         </h3>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
 
-          <button className="close-btn" onClick={() => setIsOpen(false)} title="Close">
+          <button className="close-btn" onClick={() => setIsOpen(false)} title="Minimize" aria-label="Minimize CodeCoach">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="18" y1="6" x2="6" y2="18"></line>
               <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -1046,7 +998,7 @@ export default function App() {
               <path d="M10 14.66V17c0 .55-.45 1-1 1H7v2h10v-2h-2c-.55 0-1-.45-1-1v-2.34"/>
               <path d="M18 2H6v7a6 6 0 0 0 12 0V2z"/>
             </svg>
-            Mastery & Badges
+            Mastery
           </button>
           <button
             className={`tab-btn ${activeTab === "recommendation" ? "active" : ""}`}
@@ -1055,7 +1007,7 @@ export default function App() {
             <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
             </svg>
-            Next Problem
+            Next Up
           </button>
           <button
             className={`tab-btn ${activeTab === "history" ? "active" : ""}`}
@@ -1065,7 +1017,7 @@ export default function App() {
               <polyline points="1 4 1 10 7 10"/>
               <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
             </svg>
-            Review & Sync
+            Sync
           </button>
         </div>
       )}
@@ -1102,7 +1054,7 @@ export default function App() {
                 flex: 1
               }}>
                 <span style={{ flexShrink: 0 }}>🏆</span>
-                <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                <span style={{ lineHeight: 1.35 }}>
                   Badge Test: {activeTest.topic} Level {activeTest.level}
                 </span>
                 <span style={{ fontSize: '11px', color: '#a1a1aa', fontWeight: '500', whiteSpace: 'nowrap', flexShrink: 0 }}>
@@ -1151,7 +1103,7 @@ export default function App() {
                 onClick={() => {
                   if (activeTest.problem1?.url && currentProblemId !== activeTest.problem1.id) {
                     chrome.runtime.sendMessage({ action: 'navigate_tab', url: activeTest.problem1.url }, (res) => {
-                      if (!res || !res.success) window.location.href = activeTest.problem1.url;
+                      if (!res || !res.success) goTo(activeTest.problem1.url);
                     });
                     if (window.dsaTutor?.resetEditor) {
                       window.dsaTutor.resetEditor();
@@ -1207,7 +1159,7 @@ export default function App() {
                 onClick={() => {
                   if (activeTest.problem2?.url && currentProblemId !== activeTest.problem2.id) {
                     chrome.runtime.sendMessage({ action: 'navigate_tab', url: activeTest.problem2.url }, (res) => {
-                      if (!res || !res.success) window.location.href = activeTest.problem2.url;
+                      if (!res || !res.success) goTo(activeTest.problem2.url);
                     });
                     if (window.dsaTutor?.resetEditor) {
                       window.dsaTutor.resetEditor();
@@ -1305,7 +1257,7 @@ export default function App() {
                 style={{ background: '#f59e0b1b', border: '1px solid #f59e0b66', borderRadius: '6px', padding: '8px 10px', marginBottom: '12px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
               >
                 <span style={{ fontSize: '11px', color: '#fbbf24', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  📅 <strong>{recommendation.reviews.length} question(s) due for review today!</strong>
+                  📅 <strong>{recommendation.reviews.length} {recommendation.reviews.length === 1 ? 'problem' : 'problems'} due for review today</strong>
                 </span>
                 <span style={{ fontSize: '10px', color: '#fcd34d', fontWeight: 'bold', textDecoration: 'underline' }}>Open Reviews →</span>
               </div>
@@ -1343,7 +1295,9 @@ export default function App() {
             <h4 className="section-heading">Per-Topic Mastery</h4>
             {masteryData.length === 0 ? (
               <div className="empty-state">
-                No topic data loaded. Backend offline or database empty.
+                {backendOnline === false
+                  ? 'Can’t reach the CodeCoach server right now. Try again in a minute.'
+                  : 'No topics yet. Sync your LeetCode history from the Sync tab to get started.'}
               </div>
             ) : (
               masteryData.map((data) => {
@@ -1791,7 +1745,7 @@ export default function App() {
               <div className="info-section alt-section" style={{ marginTop: '14px', background: '#18181b', border: '1px solid #27272a', borderRadius: '8px', padding: '10px 12px' }}>
                 <div className="section-label alt-label" style={{ color: '#fbbf24', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
                   <span>📝 Personal Notes & Rating</span>
-                  {savingNotesStatus && <span style={{ fontSize: '10px', color: '#4ade80' }}>✓ Saved to CSV</span>}
+                  {savingNotesStatus && <span style={{ fontSize: '10px', color: '#4ade80' }}>✓ Saved</span>}
                 </div>
                 <div style={{ display: 'flex', gap: '8px', marginBottom: '8px', alignItems: 'center' }}>
                   <span style={{ fontSize: '11px', color: '#a1a1aa' }}>Difficulty Flag:</span>
@@ -1813,7 +1767,7 @@ export default function App() {
                 <textarea
                   className="ask-input"
                   rows={2}
-                  placeholder="Add custom notes or comments for this problem (saved to CSV)..."
+                  placeholder="Add notes for this problem (included in your CSV export)…"
                   value={userNotesInput}
                   onChange={(e) => {
                     setUserNotesInput(e.target.value);
@@ -1849,7 +1803,7 @@ export default function App() {
             {focusTopics && focusTopics.length > 0 && (
               <div className="rec-focus-note">
                 <span>🎯 Focus ({focusTopics.length}/3): <strong>{focusTopics.join(', ')}</strong></span>
-                <button className="focus-change-btn-inline" onClick={() => clearFocusTopics()}>✕</button>
+                <button className="focus-change-btn-inline" onClick={() => clearFocusTopics()} aria-label="Clear focus topics" title="Clear focus topics">✕</button>
               </div>
             )}
             
@@ -1862,9 +1816,11 @@ export default function App() {
                     <div key={rec.problem_id} className="rec-item-card">
                       <div className="rec-title-row">
                         <h5 className="rec-title">{rec.title}</h5>
-                        <span className={`difficulty-badge ${rec.difficulty.toLowerCase()}`}>
-                          {rec.difficulty}
-                        </span>
+                        {rec.difficulty && (
+                          <span className={`difficulty-badge ${difficultyClass(rec.difficulty)}`}>
+                            {rec.difficulty}
+                          </span>
+                        )}
                       </div>
 
                       {rec.companies && (
@@ -1892,18 +1848,18 @@ export default function App() {
                         </div>
                       )}
 
-                      <a
+                      {safeLeetCodeUrl(rec.url) && <a
                         className="rec-item-link"
-                        href={rec.url}
+                        href={safeLeetCodeUrl(rec.url) || undefined}
                         target="_self"
                         onClick={(e) => {
                           e.preventDefault();
-                          window.location.href = rec.url;
+                          goTo(rec.url);
                         }}
                       >
                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                         Attempt Problem
-                      </a>
+                      </a>}
                     </div>
                   );
                 })}
@@ -1927,9 +1883,11 @@ export default function App() {
                         <div className="review-info">
                           <div className="review-title-row">
                             <span className="review-title">{rev.title}</span>
-                            <span className={`difficulty-badge ${rev.difficulty.toLowerCase()}`}>
-                              {rev.difficulty}
-                            </span>
+                            {rev.difficulty && (
+                              <span className={`difficulty-badge ${difficultyClass(rev.difficulty)}`}>
+                                {rev.difficulty}
+                              </span>
+                            )}
                           </div>
 
                           {rev.companies && (
@@ -1963,17 +1921,17 @@ export default function App() {
                             </div>
                           )}
                         </div>
-                        <a
+                        {safeLeetCodeUrl(rev.url) && <a
                           className="review-link-btn"
-                          href={rev.url}
+                          href={safeLeetCodeUrl(rev.url) || undefined}
                           target="_self"
                           onClick={(e) => {
                             e.preventDefault();
-                            window.location.href = rev.url;
+                            goTo(rev.url);
                           }}
                         >
                           Review Now →
-                        </a>
+                        </a>}
                       </div>
                     );
                   })
@@ -2041,17 +1999,6 @@ export default function App() {
                 ? 'Syncing history…'
                 : 'Sync All LeetCode History'}
             </button>
-
-            {/* Weekly Journal */}
-            <div style={{ marginTop: '10px' }}>
-              <button
-                className="coach-btn secondary"
-                style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', fontSize: '11px' }}
-                onClick={openWeeklyDigest}
-              >
-                <span>??</span> View AI Weekly Log
-              </button>
-            </div>
 
             {/* Solved Problems Spreadsheet Export (.csv) */}
             <div className="info-section alt-section" style={{ marginTop: '12px', background: '#18181b', border: '1px solid #27272a', padding: '10px 12px', borderRadius: '8px' }}>
@@ -2194,7 +2141,7 @@ export default function App() {
                   {weeklyData ? `Period: ${weeklyData.period_start} to ${weeklyData.period_end}` : 'Generating learning synthesis…'}
                 </div>
               </div>
-              <button onClick={() => setShowWeeklyModal(false)} style={{ background: 'transparent', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '18px' }}>✕</button>
+              <button aria-label="Close weekly log" onClick={() => setShowWeeklyModal(false)} style={{ background: 'transparent', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '18px' }}>✕</button>
             </div>
 
             {loadingWeekly ? (
@@ -2272,7 +2219,11 @@ export default function App() {
                   </button>
                 </div>
               </div>
-            ) : null}
+            ) : (
+              <div className="empty-state">
+                Couldn’t load your weekly log. Check your connection and try again.
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -2285,7 +2236,7 @@ export default function App() {
               <h3 style={{ margin: 0, fontSize: '15px', display: 'flex', alignItems: 'center', gap: '6px' }}>
                 🏆 Submit Badge Test
               </h3>
-              <button onClick={() => setShowBadgeSubmitConfirm(false)} style={{ background: 'transparent', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '16px' }}>✕</button>
+              <button aria-label="Close dialog" onClick={() => setShowBadgeSubmitConfirm(false)} style={{ background: 'transparent', border: 'none', color: '#a1a1aa', cursor: 'pointer', fontSize: '16px' }}>✕</button>
             </div>
 
             <div style={{ fontSize: '12px', color: '#d4d4d8', marginBottom: '12px' }}>
@@ -2350,7 +2301,7 @@ export default function App() {
                 <span>🏆</span>
                 <span>Badge Test Passed</span>
               </div>
-              <button onClick={() => setBadgeAwardModal(null)} style={{ background: 'transparent', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '16px' }}>✕</button>
+              <button aria-label="Close" onClick={() => setBadgeAwardModal(null)} style={{ background: 'transparent', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '16px' }}>✕</button>
             </div>
 
             {/* Badge Card */}
@@ -2408,8 +2359,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Scorecard Modal */}
-
       {/* Footer */}
       <div className="tutor-footer">
         <span>
@@ -2421,7 +2370,7 @@ export default function App() {
             AI Daily Limit: {aiQuota.limit - aiQuota.used}/{aiQuota.limit} left
           </span>
         )}
-        <span style={{color:'#27272a'}}>CodeCoach v1</span>
+        <span className="footer-version">CodeCoach{EXT_VERSION ? ` v${EXT_VERSION}` : ''}</span>
       </div>
     </div>
   );

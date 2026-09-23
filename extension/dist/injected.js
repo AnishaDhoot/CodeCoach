@@ -11,7 +11,7 @@
       window.__dsaTutorLastActionWasSubmit = false;
     } else if (/\/problems\/[^/]+\/submit\/?$/.test(u)) {
       window.__dsaTutorLastActionWasSubmit = true;
-      window.postMessage({ type: 'LEETCODE_SUBMIT_INITIATED' }, '*');
+      window.postMessage({ type: 'LEETCODE_SUBMIT_INITIATED' }, window.location.origin);
     }
   };
 
@@ -20,7 +20,7 @@
     window.postMessage({
       type: 'LEETCODE_SUBMISSION_RESULT',
       verdict: statusMsg === 'Accepted' ? 'Accepted' : statusMsg
-    }, '*');
+    }, window.location.origin);
   };
 
   const origFetch = window.fetch;
@@ -39,7 +39,7 @@
             postVerdictIfSubmit(statusMsg);
           }).catch(() => { });
         }
-      } catch (e) { }
+      } catch { /* ignore */ }
       return response;
     };
   }
@@ -62,7 +62,7 @@
             const statusMsg = data?.status_msg || data?.data?.submissionDetail?.statusDisplay || data?.data?.submissionStatus?.statusDisplay;
             postVerdictIfSubmit(statusMsg);
           }
-        } catch (e) { }
+        } catch { /* ignore */ }
       });
       return origSend.apply(this, arguments);
     };
@@ -82,7 +82,7 @@ const applyReadOnlyState = (isReadOnly) => {
       }
     }
   } catch (e) {
-    console.warn("[DSA Tutor Injected] Error updating Monaco readOnly:", e);
+    console.warn("[CodeCoach] Error updating Monaco readOnly:", e);
   }
 
   try {
@@ -134,7 +134,7 @@ const applyReadOnlyState = (isReadOnly) => {
       }
     }
   } catch (e) {
-    console.warn("[DSA Tutor Injected] Error setting DOM lock overlay:", e);
+    console.warn("[CodeCoach] Error setting DOM lock overlay:", e);
   }
 };
 
@@ -147,7 +147,7 @@ const captureInitialCodeForModel = (model) => {
     if (!window.__dsaTutorInitialCodeByUri.has(key)) {
       window.__dsaTutorInitialCodeByUri.set(key, model.getValue());
     }
-  } catch (e) { }
+  } catch { /* ignore */ }
 };
 
 const getActiveCodeModel = () => {
@@ -160,8 +160,6 @@ const getActiveCodeModel = () => {
     candidates.push({ editor, model });
   }
 
-  console.log('[DSA Tutor Injected] getActiveCodeModel candidates:', candidates.map(c => c.model.uri.toString()));
-
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0].model;
 
@@ -173,12 +171,11 @@ const getActiveCodeModel = () => {
       if (!dom) continue;
       const rect = dom.getBoundingClientRect();
       const area = rect.width * rect.height;
-      console.log('[DSA Tutor Injected] candidate area:', c.model.uri.toString(), area);
       if (area > bestArea) {
         bestArea = area;
         best = c.model;
       }
-    } catch (e) { }
+    } catch { /* ignore */ }
   }
 
   if (best) return best;
@@ -212,27 +209,6 @@ const pollInterval = setInterval(() => {
 
 window.__dsaTutorAssessmentLocked = false;
 window.__dsaTutorLockReason = "";
-
-let recentSubmitAt = 0;
-const SUBMIT_GRACE_MS = 15000;
-
-function markSubmitIntent() {
-  recentSubmitAt = Date.now();
-}
-
-function isWithinSubmitGrace() {
-  return Date.now() - recentSubmitAt < SUBMIT_GRACE_MS;
-}
-
-let lastRedirectAt = 0;
-const REDIRECT_COOLDOWN_MS = 2000;
-
-function safeRedirect(path) {
-  const now = Date.now();
-  if (now - lastRedirectAt < REDIRECT_COOLDOWN_MS) return;
-  lastRedirectAt = now;
-  window.location.replace(path);
-}
 
 const injectLockCSS = (isLocked) => {
   let styleEl = document.getElementById("dsa-tutor-fairplay-css");
@@ -429,10 +405,12 @@ const applyAssessmentTabLocking = (isLocked, reason = "Assessment Mode") => {
               <div style="font-size: 32px; margin-bottom: 8px;">🔒</div>
               <div style="font-size: 15px; font-weight: 700; color: #ef4444; margin-bottom: 8px;">Solutions, Editorial, Discussion & Submissions Locked</div>
               <div style="font-size: 12px; color: #a1a1aa; line-height: 1.5;">
-                Access to official solutions, editorials, community discussions, and past submissions is disabled during <strong>${reason}</strong> to maintain test integrity.
+                Access to official solutions, editorials, community discussions, and past submissions is disabled during <strong data-reason></strong> to maintain test integrity.
               </div>
             </div>
           `;
+          // Set via textContent so the reason string can never inject markup.
+          lockOverlay.querySelector('[data-reason]').textContent = String(reason || 'Assessment Mode');
           if (getComputedStyle(mountTarget).position === "static") {
             mountTarget.style.position = "relative";
           }
@@ -456,7 +434,7 @@ const applyAssessmentTabLocking = (isLocked, reason = "Assessment Mode") => {
       });
     }
   } catch (e) {
-    console.warn("[DSA Tutor Injected] Error applying tab locking:", e);
+    console.warn("[CodeCoach] Error applying tab locking:", e);
   }
 };
 
@@ -478,6 +456,102 @@ document.addEventListener("click", (e) => {
     return false;
   }
 }, true);
+
+// ---------------------------------------------------------------------------
+// Badge Test editor-reset guard.
+// A reset wipes the editor back to LeetCode's starter code. It must only ever
+// happen (a) while a Badge Test is active, (b) on one of that test's two
+// problems, and (c) during a short window after the user first lands on that
+// problem (to beat LeetCode restoring an old saved answer). Outside that window
+// a reset would destroy the user's in-progress test work — e.g. after a Wrong
+// Answer triggers a data refresh — so it is skipped.
+// ---------------------------------------------------------------------------
+const BADGE_CACHE_KEY = 'dsaTutorActiveBadgeTest';
+const RESET_LOG_KEY = 'dsaTutorBadgeResetLog';
+const RESET_WINDOW_MS = 6000;
+
+const currentProblemSlug = () => {
+  const m = window.location.pathname.match(/\/problems\/([^/?#]+)/);
+  return m ? m[1].toLowerCase() : '';
+};
+
+const slugOfProblem = (p) => {
+  if (!p) return '';
+  const m = String(p.url || '').match(/problems\/([^/?#]+)/);
+  return (m ? m[1] : String(p.id || '')).toLowerCase();
+};
+
+const readActiveBadgeTest = () => {
+  try {
+    const raw = window.localStorage.getItem(BADGE_CACHE_KEY);
+    if (!raw) return null;
+    const c = JSON.parse(raw);
+    if (!c || !c.data || !c.cachedAt) return null;
+    const limit = c.data.time_limit_seconds || 5400;
+    const elapsed = (c.data.elapsed_seconds || 0) + (Date.now() - c.cachedAt) / 1000;
+    return elapsed < limit ? c.data : null;
+  } catch {
+    return null;
+  }
+};
+
+const badgeResetAllowed = () => {
+  const test = readActiveBadgeTest();
+  const slug = currentProblemSlug();
+  if (!test || !slug) return false;
+  if (slug !== slugOfProblem(test.problem1) && slug !== slugOfProblem(test.problem2)) return false;
+  try {
+    const key = `${test.id}:${slug}`;
+    const log = JSON.parse(window.localStorage.getItem(RESET_LOG_KEY) || '{}');
+    if (log.testId !== test.id) {
+      log.testId = test.id;
+      log.first = {};
+    }
+    log.first = log.first || {};
+    const now = Date.now();
+    if (!log.first[key]) {
+      log.first[key] = now;
+      window.localStorage.setItem(RESET_LOG_KEY, JSON.stringify(log));
+      return true;
+    }
+    return now - log.first[key] < RESET_WINDOW_MS;
+  } catch {
+    return true;
+  }
+};
+window.__dsaBadgeResetAllowed = badgeResetAllowed;
+
+// LeetCode's language slugs don't match Monaco's language ids one-to-one.
+const MONACO_TO_LEETCODE_LANG = {
+  cpp: 'cpp', java: 'java', python: 'python3', c: 'c', csharp: 'csharp',
+  javascript: 'javascript', typescript: 'typescript', php: 'php', swift: 'swift',
+  kotlin: 'kotlin', dart: 'dart', go: 'golang', ruby: 'ruby', scala: 'scala',
+  rust: 'rust', racket: 'racket', erlang: 'erlang', elixir: 'elixir'
+};
+
+const pickStarterSnippet = (snippets, modelLang) => {
+  const bySlug = (slug) => snippets.find((s) => (s.langSlug || '').toLowerCase() === slug);
+  // 1) LeetCode remembers the selected language in localStorage.
+  try {
+    const stored = JSON.parse(window.localStorage.getItem('global_lang') || 'null');
+    if (typeof stored === 'string' && bySlug(stored.toLowerCase())) {
+      const hit = bySlug(stored.toLowerCase());
+      const expected = MONACO_TO_LEETCODE_LANG[modelLang];
+      // Trust it only if it agrees with the editor (python2/python3 both map to 'python').
+      if (!expected || hit.langSlug === expected || (modelLang === 'python' && hit.langSlug.startsWith('python'))) {
+        return hit;
+      }
+    }
+  } catch { /* ignore */ }
+  // 2) Exact mapping from the Monaco language id.
+  if (MONACO_TO_LEETCODE_LANG[modelLang] && bySlug(MONACO_TO_LEETCODE_LANG[modelLang])) {
+    return bySlug(MONACO_TO_LEETCODE_LANG[modelLang]);
+  }
+  return bySlug(modelLang) || null;
+};
+
+const ORIGINAL_CONFIRM = window.confirm;
+let confirmRestoreTimer = null;
 
 window.addEventListener("message", (event) => {
   if (event.source !== window) return;
@@ -502,7 +576,7 @@ window.addEventListener("message", (event) => {
 
       window.postMessage({ type: "CODE_VALUE", code: code }, window.location.origin);
     } catch (e) {
-      console.error("[DSA Tutor Injected] Error reading Monaco editor:", e);
+      console.error("[CodeCoach] Error reading Monaco editor:", e);
       window.postMessage({ type: "CODE_VALUE", code: "", error: e.message }, window.location.origin);
     }
   }
@@ -517,10 +591,11 @@ window.addEventListener("message", (event) => {
 
   if (event.data && event.data.type === "PING_INJECTED") {
     window.__dsaTutorInjectedReady = true;
-    window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
+    window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, window.location.origin);
   }
 
   if (event.data && event.data.type === "RESET_EDITOR") {
+    if (!badgeResetAllowed()) return;
     try {
       const getCsrfToken = () => {
         const match = document.cookie.match(/csrftoken=([^;]+)/);
@@ -567,48 +642,33 @@ window.addEventListener("message", (event) => {
           if (!bestModel) return false;
 
           const modelLang = (bestModel.getLanguageId ? bestModel.getLanguageId() : '').toLowerCase();
-          let match = snippets.find(s => {
-            const slug = (s.langSlug || '').toLowerCase();
-            const langName = (s.lang || '').toLowerCase();
-            return slug === modelLang || langName.includes(modelLang) || modelLang.includes(slug);
-          });
-
-          if (!match && modelLang === 'python') {
-            match = snippets.find(s => s.langSlug === 'python3' || s.langSlug === 'python');
-          }
-          if (!match && (modelLang === 'javascript' || modelLang === 'typescript')) {
-            match = snippets.find(s => s.langSlug === 'javascript' || s.langSlug === 'typescript');
-          }
-          if (!match) {
-            match = snippets[0];
-          }
+          // Never fall back to an arbitrary language's snippet: if we can't find
+          // the right one, let the native-reset / snapshot path handle it.
+          const match = pickStarterSnippet(snippets, modelLang);
 
           if (match && match.code) {
-            console.log('[DSA Tutor Injected] Applied official starter code via GraphQL for', titleSlug, match.langSlug);
             bestModel.setValue(match.code);
             if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
             [20, 80, 200, 500, 1000].forEach(delay => setTimeout(tryConfirmModal, delay));
             return true;
           }
         } catch (e) {
-          console.warn('[DSA Tutor Injected] Failed to fetch starter snippet from GraphQL:', e);
+          console.warn('[CodeCoach] Failed to fetch starter snippet from GraphQL:', e);
         }
         return false;
       };
 
-      const debugReset = (msg, data) => {
-        console.log(`[DSA Tutor DEBUG] ${msg}`, data !== undefined ? data : '');
-      };
+      const debugReset = () => {};
 
-      // Temporarily auto-approve native window.confirm dialogs during reset so user is never prompted
-      const origConfirm = window.confirm;
-      if (origConfirm) {
-        window.confirm = function (...args) {
-          debugReset('Auto-approving window.confirm dialog during reset', args);
-          return true;
-        };
-        setTimeout(() => {
-          window.confirm = origConfirm;
+      // Temporarily auto-approve LeetCode's "reset code?" confirm during the
+      // reset. Always restore the ORIGINAL confirm (captured once at load) so
+      // overlapping resets can never leave confirm() permanently overridden.
+      if (ORIGINAL_CONFIRM) {
+        window.confirm = function () { return true; };
+        if (confirmRestoreTimer) clearTimeout(confirmRestoreTimer);
+        confirmRestoreTimer = setTimeout(() => {
+          window.confirm = ORIGINAL_CONFIRM;
+          confirmRestoreTimer = null;
         }, 4000);
       }
 
@@ -624,14 +684,13 @@ window.addEventListener("message", (event) => {
             const initialCode = window.__dsaTutorInitialCodeByUri?.get(key);
             if (initialCode !== undefined) {
               debugReset('Snapshot fallback applied', { uri: key, length: initialCode.length });
-              console.warn('[DSA Tutor Injected] Native reset button not found — falling back to snapshot');
               bestModel.setValue(initialCode);
               if (window.__dsaRevealEditorSoon) window.__dsaRevealEditorSoon();
               [20, 80, 200, 500, 1000].forEach(delay => setTimeout(tryConfirmModal, delay));
             }
           }
         } catch (e) {
-          console.warn('[DSA Tutor Injected] Snapshot fallback failed:', e);
+          console.warn('[CodeCoach] Snapshot fallback failed:', e);
         }
       };
 
@@ -641,9 +700,9 @@ window.addEventListener("message", (event) => {
           try {
             const evt = new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window });
             el.dispatchEvent(evt);
-          } catch (e) { }
+          } catch { /* ignore */ }
         });
-        try { el.click(); } catch (e) { }
+        try { el.click(); } catch { /* ignore */ }
       };
 
       const findResetButton = () => {
@@ -737,11 +796,11 @@ window.addEventListener("message", (event) => {
                   dlg.style.setProperty("visibility", "hidden", "important");
                   dlg.style.setProperty("opacity", "0", "important");
                   dlg.style.setProperty("pointer-events", "none", "important");
-                } catch (e) { }
+                } catch { /* ignore */ }
               }, 60);
             }
           }
-        } catch (e) { }
+        } catch { /* ignore */ }
       };
 
       const tryConfirmModal = () => {
@@ -819,7 +878,7 @@ window.addEventListener("message", (event) => {
         }, 400);
       }
     } catch (e) {
-      console.error("[DSA Tutor Injected] Error resetting editor:", e);
+      console.error("[CodeCoach] Error resetting editor:", e);
     }
   }
 });
@@ -837,7 +896,7 @@ setInterval(() => {
 }, 1000);
 
 window.__dsaTutorInjectedReady = true;
-window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
+window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, window.location.origin);
 
 // ---------------------------------------------------------------------------
 // Early Badge Test pre-reset.
@@ -863,7 +922,7 @@ window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
       const limit = c.data.time_limit_seconds || 5400;
       const elapsed = (c.data.elapsed_seconds || 0) + (Date.now() - c.cachedAt) / 1000;
       return elapsed < limit ? c : null;
-    } catch (e) {
+    } catch {
       return null;
     }
   };
@@ -883,9 +942,10 @@ window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
 
   if (!/\/problems\/[^/]+/.test(window.location.pathname)) return;
   if (!readCache()) return;
-
   window.__dsaTutorAssessmentLocked = true;
   window.__dsaTutorLockReason = 'Badge Test';
+  // Already reset this problem earlier in the test: keep the user's work.
+  if (!badgeResetAllowed()) return;
 
   const style = document.createElement('style');
   style.id = STYLE_ID;
@@ -894,7 +954,7 @@ window.postMessage({ type: 'DSA_TUTOR_INJECTED_READY' }, '*');
 
   [0, 250, 600, 1000, 1600, 2400].forEach((d) =>
     setTimeout(() => {
-      if (!revealed) window.postMessage({ type: 'RESET_EDITOR' }, '*');
+      if (!revealed) window.postMessage({ type: 'RESET_EDITOR' }, window.location.origin);
     }, d)
   );
   // Failsafe: never leave the editor hidden.

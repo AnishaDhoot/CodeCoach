@@ -11,15 +11,20 @@ export class ErrorBoundary extends React.Component {
   }
 
   componentDidCatch(error, errorInfo) {
-    console.error('[DSA Tutor] Caught in ErrorBoundary:', error, errorInfo);
+    console.error('[CodeCoach] Panel error:', error, errorInfo);
   }
 
   render() {
     if (this.state.hasError) {
       return (
-        <div style={{
+        <div role="alert" style={{
+          // The mount point is a 0x0 fixed box, so pin the fallback on screen.
+          position: 'fixed',
+          top: '12px',
+          right: '12px',
+          width: 'min(340px, calc(100vw - 24px))',
+          boxSizing: 'border-box',
           padding: '16px',
-          margin: '12px',
           background: '#18181b',
           border: '1px solid #ef4444',
           borderRadius: '8px',
@@ -28,7 +33,7 @@ export class ErrorBoundary extends React.Component {
           fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
         }}>
           <div style={{ fontWeight: '600', color: '#f87171', marginBottom: '6px' }}>
-            ⚠️ DSA Tutor encountered a display error
+            ⚠️ CodeCoach hit a display error
           </div>
           <p style={{ margin: '0 0 10px 0', color: '#a1a1aa', fontSize: '11px', lineHeight: '1.4' }}>
             {this.state.error?.message || 'An unexpected rendering error occurred.'}
@@ -48,7 +53,7 @@ export class ErrorBoundary extends React.Component {
               cursor: 'pointer'
             }}
           >
-            Reload Extension Panel
+            Reload panel
           </button>
         </div>
       );

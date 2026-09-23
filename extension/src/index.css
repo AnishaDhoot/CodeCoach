@@ -3,9 +3,11 @@
    Palette: #0a0a0b bg, #111113 surface, #1c1c1f border,
             #f4f4f5 primary text, #a1a1aa secondary, #71717a muted,
             #22c55e accent (green)
-   Font: Inter / system
+   Font: Inter if installed, otherwise the system UI font.
+   (No remote font import: @font-face doesn't apply inside Shadow DOM, and
+   loading Google Fonts on every LeetCode page would leak requests to a
+   third party.)
    ============================================================ */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
 #dsa-tutor-react-container {
   pointer-events: auto;
@@ -107,31 +109,16 @@
   color: #e4e4e7;
 }
 
-/* ── Trigger Icon (Collapsed State) ── */
-.tutor-trigger {
-  position: fixed;
-  top: 140px;
-  right: 0;
-  width: 36px;
-  height: 36px;
-  background: #0e0e10;
-  border: 1px solid #1f1f23;
-  border-right: none;
-  border-radius: 8px 0 0 8px;
-  box-shadow: -4px 0 12px rgba(0,0,0,0.5);
-  color: #fbbf24;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  z-index: 999999;
-  transition: all 0.2s ease;
-}
-
-.tutor-trigger:hover {
-  background: #18181b;
-  width: 42px;
+/* ── Streak pill (header) ── */
+.streak-pill {
+  font-size: 11px;
+  font-weight: 500;
   color: #f59e0b;
+  background: #1c1c1f;
+  border: 1px solid #27272a;
+  padding: 1px 7px;
+  border-radius: 999px;
+  line-height: 18px;
 }
 
 /* ── Tabs ── */
@@ -234,7 +221,10 @@
   justify-content: center;
   color: #d4d4d8;
   cursor: pointer;
-  z-index: 999998;
+  z-index: 2147483647;
+  padding: 0;
+  font: inherit;
+  appearance: none;
   transition: all 0.15s ease;
 }
 
@@ -243,6 +233,15 @@
   border-color: #3f3f46;
   color: #e4e4e7;
   transform: scale(1.05);
+}
+
+.tutor-trigger:focus-visible,
+#dsa-tutor-panel-container button:focus-visible,
+#dsa-tutor-panel-container select:focus-visible,
+#dsa-tutor-panel-container textarea:focus-visible,
+#dsa-tutor-panel-container a:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
 }
 
 /* ── Section heading ── */
@@ -320,6 +319,8 @@
   font-size: 10px;
   cursor: pointer;
   margin-left: 6px;
+  padding: 0;
+  flex-shrink: 0;
   transition: all 0.15s;
 }
 
@@ -1273,6 +1274,20 @@
   gap: 5px;
 }
 
+.footer-version {
+  color: #52525b;
+}
+
+.footer-contact {
+  color: #71717a;
+  text-decoration: none;
+}
+
+.footer-contact:hover {
+  color: #e4e4e7;
+  text-decoration: underline;
+}
+
 .status-dot {
   width: 5px;
   height: 5px;
@@ -1879,4 +1894,4 @@
 .celebration-btn-primary:hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 16px rgba(245, 158, 11, 0.45);
-}
+}

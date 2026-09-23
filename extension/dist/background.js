@@ -2,7 +2,7 @@
 // Handles API calls to the local FastAPI backend to bypass CORS and extension constraints,
 // and fetches the user's LeetCode solved-problem history via scripting injection.
 
-let DEFAULT_BACKEND_URL = "https://codecoach-backend-hja6.onrender.com";
+const DEFAULT_BACKEND_URL = "https://codecoach-backend-hja6.onrender.com";
 
 async function getBackendUrl() {
   try {
@@ -11,7 +11,7 @@ async function getBackendUrl() {
       return data.customBackendUrl.replace(/\/+$/, "");
     }
   } catch (e) {
-    console.warn("[DSA Tutor Background] Failed to read storage URL:", e);
+    console.warn("[CodeCoach] Failed to read storage URL:", e);
   }
   return DEFAULT_BACKEND_URL;
 }
@@ -28,7 +28,7 @@ async function getAuthToken() {
     const data = await chrome.storage.local.get("authToken");
     if (data && data.authToken) return data.authToken;
   } catch (e) {
-    console.warn("[DSA Tutor Background] Failed to read auth token:", e);
+    console.warn("[CodeCoach] Failed to read auth token:", e);
   }
 
   if (_tokenPromise) return _tokenPromise;
@@ -45,7 +45,7 @@ async function getAuthToken() {
     try {
       await chrome.storage.local.set({ authToken: token });
     } catch (e) {
-      console.warn("[DSA Tutor Background] Failed to persist auth token:", e);
+      console.warn("[CodeCoach] Failed to persist auth token:", e);
     }
     return token;
   })();
@@ -72,10 +72,24 @@ async function backendFetch(path, { method = "GET", body } = {}) {
       const token = await getAuthToken();
       if (token) opts.headers["Authorization"] = `Bearer ${token}`;
     } catch (e) {
-      console.warn("[DSA Tutor Background] Proceeding without auth token:", e);
+      console.warn("[CodeCoach] Proceeding without auth token:", e);
     }
   }
-  const res = await fetch(`${baseUrl}${path}`, opts);
+  let res = await fetch(`${baseUrl}${path}`, opts);
+  // A stale/unknown token (e.g. backend database reset) would otherwise fail
+  // forever. Drop it, mint a fresh one, and retry the request once.
+  if (res.status === 401 && path !== "/auth/register" && opts.headers["Authorization"]) {
+    try {
+      await chrome.storage.local.remove("authToken");
+      const fresh = await getAuthToken();
+      if (fresh) {
+        opts.headers["Authorization"] = `Bearer ${fresh}`;
+        res = await fetch(`${baseUrl}${path}`, opts);
+      }
+    } catch (e) {
+      console.warn("[CodeCoach] Token refresh failed:", e);
+    }
+  }
   if (!res.ok) {
     let errorDetail = "";
     try {
@@ -83,7 +97,7 @@ async function backendFetch(path, { method = "GET", body } = {}) {
       if (errData && errData.detail) {
         errorDetail = typeof errData.detail === "string" ? errData.detail : JSON.stringify(errData.detail);
       }
-    } catch (e) { }
+    } catch { /* ignore */ }
 
     if (res.status === 429) {
       throw new Error(errorDetail || "Limit Exceeded: Daily AI request limit reached. Please try again tomorrow.");
@@ -105,15 +119,19 @@ async function backendFetch(path, { method = "GET", body } = {}) {
 // This has no page-size limit — one request gives the full history.
 // ---------------------------------------------------------------------------
 
-async function fetchSolvedProblemsViaTab() {
-  // Find an open leetcode.com tab to piggy-back on.
-  const tabs = await chrome.tabs.query({ url: "https://leetcode.com/*" });
-  if (!tabs || tabs.length === 0) {
-    throw new Error(
-      "No LeetCode tab found. Please open leetcode.com in a tab and try again."
-    );
+async function fetchSolvedProblemsViaTab(preferredTabId) {
+  // Prefer the LeetCode tab that asked for the sync; otherwise find any open one.
+  let tabId = preferredTabId;
+  if (!tabId) {
+    const tabs = await chrome.tabs.query({ url: "https://leetcode.com/*" });
+    const usable = (tabs || []).find((t) => !t.discarded) || (tabs || [])[0];
+    if (!usable) {
+      throw new Error(
+        "No LeetCode tab found. Please open leetcode.com in a tab and try again."
+      );
+    }
+    tabId = usable.id;
   }
-  const tabId = tabs[0].id;
 
   // Inject script into the LeetCode page (MAIN world = same-origin fetch).
   const results = await chrome.scripting.executeScript({
@@ -175,7 +193,7 @@ async function fetchSolvedProblemsViaTab() {
           }
         }
       } catch (e) {
-        console.warn("[DSA Tutor] Submission timestamp fetch notice:", e);
+        console.warn("[CodeCoach] Submission timestamp fetch notice:", e);
       }
 
       // ── Step 2: Fetch topic tags via bulk GraphQL ────────────────────────────
@@ -206,7 +224,7 @@ async function fetchSolvedProblemsViaTab() {
           }
         }
       } catch (e) {
-        console.warn("[DSA Tutor] Bulk topic fetch skipped/timed out; using per-slug fallback:", e);
+        console.warn("[CodeCoach] Bulk topic fetch skipped/timed out; using per-slug fallback:", e);
       }
 
       const CANONICAL_TOPIC_MAP = {
@@ -341,13 +359,19 @@ async function updateReviewBadge() {
     } else {
       chrome.action.setBadgeText({ text: "" });
     }
-  } catch (err) {
-    console.log("[DSA Tutor Background] Failed to fetch review count for badge:", err);
+  } catch {
+    // Backend asleep/offline: leave the badge as-is.
   }
 }
 
-// Set up alarm every 15 mins
-chrome.alarms.create("check_reviews_due", { periodInMinutes: 15 });
+// Set up alarm every 15 mins. Only create it if it doesn't exist yet: calling
+// create() on every service-worker wake would reset the timer, and since MV3
+// workers wake often, the alarm could otherwise never fire.
+chrome.alarms.get("check_reviews_due").then((existing) => {
+  if (!existing) chrome.alarms.create("check_reviews_due", { periodInMinutes: 15 });
+}).catch(() => {
+  chrome.alarms.create("check_reviews_due", { periodInMinutes: 15 });
+});
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "check_reviews_due") {
     updateReviewBadge();
@@ -359,8 +383,18 @@ updateReviewBadge();
 // ---------------------------------------------------------------------------
 // Message router
 // ---------------------------------------------------------------------------
+const isLeetCodeUrl = (url) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" && (u.hostname === "leetcode.com" || u.hostname.endsWith(".leetcode.com"));
+  } catch {
+    return false;
+  }
+};
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  console.log("[DSA Tutor Background] Received message:", request);
+  // Only accept messages from this extension's own scripts.
+  if (sender.id !== chrome.runtime.id || !request || typeof request.action !== "string") return;
 
   // --- Backend passthrough actions ---
   if (request.action === "analyze_submission") {
@@ -432,8 +466,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "record_success") {
-    const { problem_id, topic } = request.payload;
-    backendFetch(`/submissions/success?problem_id=${problem_id}&topic=${encodeURIComponent(topic)}`, { method: "POST" })
+    const { problem_id, topic } = request.payload || {};
+    backendFetch(`/submissions/success?problem_id=${encodeURIComponent(problem_id || "")}&topic=${encodeURIComponent(topic || "")}`, { method: "POST" })
       .then((data) => sendResponse({ success: true, data }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -462,15 +496,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "navigate_tab") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs && tabs[0] && tabs[0].id) {
-        chrome.tabs.update(tabs[0].id, { url: request.url }, () => {
-          sendResponse({ success: true });
-        });
-      } else {
-        sendResponse({ success: false, error: "No active tab found" });
-      }
-    });
+    const tabId = sender.tab && sender.tab.id;
+    if (!tabId || !isLeetCodeUrl(request.url)) {
+      sendResponse({ success: false, error: "Invalid navigation target" });
+      return false;
+    }
+    chrome.tabs.update(tabId, { url: request.url })
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
 
@@ -571,7 +604,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // --- LeetCode history fetch (injects into LeetCode tab for same-origin access) ---
   if (request.action === "fetch_leetcode_history") {
-    fetchSolvedProblemsViaTab()
+    fetchSolvedProblemsViaTab(sender.tab && sender.tab.id)
       .then(({ problems, username }) => sendResponse({ success: true, data: { problems, username } }))
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -617,13 +650,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === "export_solved_csv") {
     const timeframe = request.payload?.timeframe || "current_week";
-    Promise.all([getBackendUrl(), getAuthToken().catch(() => null)]).then(([baseUrl, token]) => {
-      const headers = token ? { Authorization: `Bearer ${token}` } : {};
-      fetch(`${baseUrl}/export/solved-csv?timeframe=${encodeURIComponent(timeframe)}`, { headers })
-        .then((res) => res.text())
-        .then((data) => sendResponse({ success: true, data }))
-        .catch((err) => sendResponse({ success: false, error: err.message }));
-    });
+    Promise.all([getBackendUrl(), getAuthToken().catch(() => null)])
+      .then(([baseUrl, token]) => {
+        const headers = token ? { Authorization: `Bearer ${token}` } : {};
+        return fetch(`${baseUrl}/export/solved-csv?timeframe=${encodeURIComponent(timeframe)}`, { headers });
+      })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Export failed (HTTP ${res.status})`);
+        return res.text();
+      })
+      .then((data) => sendResponse({ success: true, data }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
   }
 
@@ -643,6 +680,3 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 });
-
-
-

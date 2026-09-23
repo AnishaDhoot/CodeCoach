@@ -37,7 +37,7 @@ describe('Badge Test local cache', () => {
     const { container } = render(<App />);
     await waitFor(() => expect(container.querySelector('.test-mode-container')).toBeNull());
     expect(window.localStorage.getItem(KEY)).toBeNull();
-    expect(posted).toHaveBeenCalledWith({ type: 'REVEAL_EDITOR' }, '*');
+    expect(posted).toHaveBeenCalledWith({ type: 'REVEAL_EDITOR' }, window.location.origin);
   });
 
   it('ignores an expired cached test', () => {

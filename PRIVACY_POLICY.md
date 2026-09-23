@@ -1,13 +1,11 @@
 # CodeCoach Agent — Privacy Policy
 
-_Last updated: 2026-09-17_
+_Last updated: 2026-09-23_ · Contact: codecoach.work@gmail.com
 
 CodeCoach Agent ("the extension") is a study companion that overlays LeetCode to
 give you conceptual failure diagnostics, progressive hints, spaced-repetition
 reviews, and progress tracking. This policy explains exactly what data the
 extension handles, why, and who it is shared with. Plain language, no surprises.
-
-> **Replace `<CONTACT_EMAIL>` and `<BACKEND_URL>` below before publishing.**
 
 ## What the extension accesses
 
@@ -27,15 +25,15 @@ While you are on `leetcode.com`, and only when you use a feature that needs it:
 
 Your practice data — solved problems, attempts, mistake categories, topic mastery,
 streaks, spaced-repetition schedules, notes — is stored on the extension's backend
-(`<BACKEND_URL>`) in a database, associated with a **random device token** the
+(`https://codecoach-backend-hja6.onrender.com`) in a database, associated with a **random device token** the
 extension generates on first run and keeps in `chrome.storage.local`.
 
 - The device token is **anonymous**. It is not your name, email, or LeetCode login.
 - We do **not** collect your name, email address, password, LeetCode credentials,
   payment information, browsing history, or any data from sites other than LeetCode.
-- Your LeetCode session cookies are **never** read, stored, or transmitted by us;
-  the sync runs inside LeetCode's own page context and only reads the public
-  problem-status API you are already authenticated to.
+- Your LeetCode session cookies are **never** stored or sent to our backend. The
+  sync runs inside LeetCode's own page context, so LeetCode's own requests carry
+  your existing session; the extension only reads your problem-status data from it.
 
 ## Third parties
 
@@ -48,12 +46,11 @@ extension generates on first run and keeps in `chrome.storage.local`.
 
 ## Data retention and control
 
-- Practice data persists so your progress is there next time. You can clear
-  spaced-repetition data in the app, and you can erase your local identity at any
-  time by clearing the extension's site data (which removes the device token; a new
-  anonymous token is created on next use).
+- Practice data persists so your progress is there next time. You can erase your
+  local identity at any time by removing the extension or clearing its data (which
+  removes the device token; a new anonymous token is created on next use).
 - To request deletion of the data associated with your device token, contact
-  `<CONTACT_EMAIL>`.
+  `codecoach.work@gmail.com`.
 
 ## Permission justifications (for Chrome Web Store review)
 
@@ -61,10 +58,9 @@ extension generates on first run and keeps in `chrome.storage.local`.
 |---|---|
 | `storage` | Store the anonymous device token and your settings locally. |
 | `scripting` | Inject the sync routine into your open LeetCode tab so it can read your solved-problem history in LeetCode's own (same-origin) context. |
-| `tabs` | Find your open LeetCode tab to run the sync, and open a recommended problem when you click it. |
 | `alarms` | Periodically refresh the "reviews due" badge count on the toolbar icon. |
 | `host_permissions: leetcode.com` | The overlay, page scraping, and history sync run only on LeetCode. |
-| `host_permissions: <BACKEND_URL>` | Talk to the extension's backend to save and load your progress. |
+| `host_permissions: https://codecoach-backend-hja6.onrender.com` | Talk to the extension's backend to save and load your progress. |
 
 ## Children's privacy
 
@@ -78,4 +74,4 @@ date above and in the extension's listing.
 
 ## Contact
 
-Questions or data-deletion requests: `<CONTACT_EMAIL>`.
+Questions or data-deletion requests: codecoach.work@gmail.com

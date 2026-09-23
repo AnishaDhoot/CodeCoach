@@ -134,8 +134,10 @@ const scrapeConstraints = () => {
 const scrapeProblemIdentity = () => {
   const urlMatch = window.location.href.match(/problems\/([^/]+)/);
   const problemId = urlMatch ? urlMatch[1] : 'unknown-problem';
-  const docTitle = document.title || '';
-  const problemTitle = docTitle.split('-')[0].trim() || problemId;
+  // Titles look like "Two Sum II - Input Array Is Sorted - LeetCode": only strip
+  // the trailing site suffix so hyphenated problem names stay intact.
+  const docTitle = (document.title || '').replace(/\s+[-|–]\s+LeetCode.*$/i, '').trim();
+  const problemTitle = docTitle || problemId;
   return { problemId, problemTitle };
 };
 
@@ -148,7 +150,7 @@ window.addEventListener('message', (event) => {
     injectedReady = true;
     if (pendingReset) {
       pendingReset = false;
-      window.postMessage({ type: 'RESET_EDITOR' }, '*');
+      window.postMessage({ type: 'RESET_EDITOR' }, window.location.origin);
     }
   }
 });
@@ -160,21 +162,16 @@ window.dsaTutor = Object.assign(window.dsaTutor || {}, {
   getIdentity: scrapeProblemIdentity,
   resetEditor: () => {
     if (!injectedReady && !window.__dsaTutorInjectedReady) {
+      // Page script not ready yet: queue one reset for when it announces itself.
       pendingReset = true;
-      window.postMessage({ type: 'PING_INJECTED' }, '*');
-      window.postMessage({ type: 'RESET_EDITOR' }, '*');
+      window.postMessage({ type: 'PING_INJECTED' }, window.location.origin);
       return;
     }
-    window.postMessage({ type: 'RESET_EDITOR' }, '*');
-    if (window.__dsaTutorResetEditor) {
-      try { window.__dsaTutorResetEditor(); } catch (e) { }
-    }
+    window.postMessage({ type: 'RESET_EDITOR' }, window.location.origin);
   }
 });
 
-let lastTriggerTime = 0;
 const processedVerdictNodes = new WeakSet();
-const lastDetectedSubmissions = new Map();
 
 const scrapeFailingTestcase = () => {
   let input = '';
@@ -225,11 +222,10 @@ let lastSubmissionKey = null;
 let lastSubmissionTime = 0;
 const SUBMISSION_COOLDOWN_MS = 8000;
 
-const handleVerdictDetected = (verdict, source = 'dom') => {
+const handleVerdictDetected = (verdict) => {
   return new Promise((resolve) => {
     const { problemId, problemTitle } = scrapeProblemIdentity();
-    console.log(`[DSA Tutor Content] Processing submission verdict: ${verdict} for ${problemId} [source: ${source}]`);
-    window.dsaTutor?.setLoading(true);
+    window.dsaTutor?.setLoading?.(true);
 
     if (verdict === 'Accepted') {
       // Reflect the solve in the Badge Test panel immediately; the backend
@@ -323,55 +319,35 @@ const handleVerdictDetected = (verdict, source = 'dom') => {
   });
 };
 
-function tryHandleVerdict(verdict, source = 'dom') {
+function tryHandleVerdict(verdict, _source = 'dom') {
   const { problemId } = scrapeProblemIdentity();
   const key = `${problemId}:${verdict}`;
   const now = Date.now();
 
-  if (isAnalyzingSubmission) {
-    console.log(`[DSA Tutor Content] Ignored duplicate ${verdict} from ${source}: analysis already in-flight.`);
-    return false;
-  }
-
-  if (key === lastSubmissionKey && (now - lastSubmissionTime) < SUBMISSION_COOLDOWN_MS) {
-    console.log(`[DSA Tutor Content] Ignored ${verdict} from ${source}: within cooldown (${now - lastSubmissionTime}ms).`);
-    return false;
-  }
+  if (isAnalyzingSubmission) return false;
+  if (key === lastSubmissionKey && (now - lastSubmissionTime) < SUBMISSION_COOLDOWN_MS) return false;
 
   isAnalyzingSubmission = true;
   lastSubmissionKey = key;
   lastSubmissionTime = now;
-  lastSubmitClickTimestamp = 0;
   recentSubmitAt = 0;
 
-  handleVerdictDetected(verdict, source).finally(() => {
+  handleVerdictDetected(verdict).finally(() => {
     isAnalyzingSubmission = false;
   });
 
   return true;
 }
 
-let lastSubmitClickTimestamp = 0;
 let recentSubmitAt = 0;
 const SUBMIT_GRACE_MS = 15000;
 
 function markSubmitIntent() {
   recentSubmitAt = Date.now();
-  lastSubmitClickTimestamp = Date.now();
 }
 
 function isWithinSubmitGrace() {
   return Date.now() - recentSubmitAt < SUBMIT_GRACE_MS;
-}
-
-let lastRedirectAt = 0;
-const REDIRECT_COOLDOWN_MS = 2000;
-
-function safeRedirect(path) {
-  const now = Date.now();
-  if (now - lastRedirectAt < REDIRECT_COOLDOWN_MS) return;
-  lastRedirectAt = now;
-  window.location.replace(path);
 }
 
 document.addEventListener('click', (e) => {
@@ -405,7 +381,6 @@ const checkUrlChange = () => {
   if (window.location.href !== lastHref) {
     lastHref = window.location.href;
     recentSubmitAt = 0;
-    lastSubmitClickTimestamp = 0;
     window.dispatchEvent(new CustomEvent('dsa-tutor-url-change', { detail: { url: lastHref } }));
   }
 };
@@ -415,6 +390,9 @@ setInterval(checkUrlChange, 1000);
 
 // Channel 1: Primary Network Interception Message Listener
 window.addEventListener('message', (event) => {
+  // Only trust messages posted by the page itself (our injected script), not
+  // by embedded iframes.
+  if (event.source !== window || event.origin !== window.location.origin) return;
   if (event.data && event.data.type === 'LEETCODE_SUBMISSION_RESULT') {
     const verdict = event.data.verdict;
     if (verdict) {
@@ -451,7 +429,7 @@ const checkNodeForVerdict = (node) => {
       }
 
       processedVerdictNodes.add(node);
-      try { node.dataset.dsaProcessed = "true"; } catch (e) { }
+      try { node.dataset.dsaProcessed = "true"; } catch { /* read-only node */ }
 
       tryHandleVerdict(v, 'dom');
       break;
@@ -460,6 +438,9 @@ const checkNodeForVerdict = (node) => {
 };
 
 const observer = new MutationObserver((mutations) => {
+  // Verdicts only matter right after a submit; skip the (expensive) subtree
+  // scan for every other DOM change, e.g. each keystroke in the editor.
+  if (!isWithinSubmitGrace()) return;
   for (const mutation of mutations) {
     if (mutation.addedNodes.length === 0) continue;
     for (const node of mutation.addedNodes) {
@@ -654,15 +635,23 @@ window.dsaTutor.getLanguage = scrapeCurrentLanguage;
 window.dsaTutor.getConstraints = scrapeConstraints;
 window.dsaTutor.getIdentity = scrapeProblemIdentity;
 window.dsaTutor.setEditorReadOnly = (readOnly) => {
-  window.postMessage({ type: 'SET_READ_ONLY', readOnly }, '*');
+  window.postMessage({ type: 'SET_READ_ONLY', readOnly }, window.location.origin);
 };
 window.dsaTutor.setAssessmentLocked = (locked, reason) => {
   applyDirectTabLocking(locked, reason);
-  window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked, reason }, '*');
+  window.postMessage({ type: 'SET_ASSESSMENT_LOCKED', locked, reason }, window.location.origin);
 };
 
-observer.observe(document.body, { childList: true, subtree: true });
-console.log('[DSA Tutor Content] DOM observer and overlay UI initialized.');
+observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+
+// Only allow links to LeetCode itself from backend-provided data.
+const safeLeetCodeUrl = (url) => {
+  try {
+    const u = new URL(url, 'https://leetcode.com');
+    if (u.protocol === 'https:' && (u.hostname === 'leetcode.com' || u.hostname.endsWith('.leetcode.com'))) return u.href;
+  } catch { /* invalid URL */ }
+  return null;
+};
 
 const injectSpacedRepetitionReminder = () => {
   try {
@@ -670,7 +659,7 @@ const injectSpacedRepetitionReminder = () => {
     const todayStr = new Date().toISOString().split('T')[0];
     const isDismissedToday = localStorage.getItem('dsa_tutor_spaced_reminder_dismissed_date') === todayStr;
     if (isDismissedSession || isDismissedToday) return;
-  } catch (e) {}
+  } catch { /* storage unavailable */ }
 
   chrome.runtime.sendMessage({ action: 'get_recommendation' }, (res) => {
     if (res && res.success && res.data && res.data.reviews && res.data.reviews.length > 0) {
@@ -720,6 +709,8 @@ const injectSpacedRepetitionReminder = () => {
 
       const closeBtn = document.createElement('button');
       closeBtn.innerText = '✕';
+      closeBtn.setAttribute('aria-label', 'Dismiss review reminder');
+      closeBtn.title = 'Dismiss for today';
       Object.assign(closeBtn.style, {
         background: 'transparent',
         border: 'none',
@@ -735,7 +726,7 @@ const injectSpacedRepetitionReminder = () => {
         try {
           sessionStorage.setItem('dsa_tutor_spaced_reminder_dismissed', 'true');
           localStorage.setItem('dsa_tutor_spaced_reminder_dismissed_date', new Date().toISOString().split('T')[0]);
-        } catch (e) {}
+        } catch { /* storage unavailable */ }
         reminderDiv.remove();
       };
 
@@ -762,8 +753,10 @@ const injectSpacedRepetitionReminder = () => {
       });
 
       dueReviews.forEach((rev) => {
+        const href = safeLeetCodeUrl(rev.url);
+        if (!href) return;
         const itemA = document.createElement('a');
-        itemA.href = rev.url;
+        itemA.href = href;
         itemA.target = '_top';
         Object.assign(itemA.style, {
           display: 'flex',
@@ -800,7 +793,7 @@ const injectSpacedRepetitionReminder = () => {
         });
 
         const textSpan = document.createElement('span');
-        textSpan.innerText = rev.title;
+        textSpan.innerText = rev.title || 'Untitled problem';
         textSpan.style.fontWeight = '600';
         textSpan.style.fontSize = '12px';
         textSpan.style.overflow = 'hidden';
@@ -817,7 +810,8 @@ const injectSpacedRepetitionReminder = () => {
         titleCol.appendChild(stageSpan);
 
         const diffSpan = document.createElement('span');
-        diffSpan.innerText = rev.difficulty;
+        const difficulty = String(rev.difficulty || 'Medium');
+        diffSpan.innerText = difficulty;
         Object.assign(diffSpan.style, {
           fontSize: '9px',
           fontWeight: '700',
@@ -827,11 +821,11 @@ const injectSpacedRepetitionReminder = () => {
           letterSpacing: '0.5px'
         });
 
-        if (rev.difficulty.toLowerCase() === 'easy') {
+        if (difficulty.toLowerCase() === 'easy') {
           diffSpan.style.color = '#4ade80';
           diffSpan.style.backgroundColor = 'rgba(74, 222, 128, 0.12)';
           diffSpan.style.border = '1px solid rgba(74, 222, 128, 0.25)';
-        } else if (rev.difficulty.toLowerCase() === 'medium') {
+        } else if (difficulty.toLowerCase() === 'medium') {
           diffSpan.style.color = '#fbbf24';
           diffSpan.style.backgroundColor = 'rgba(251, 191, 36, 0.12)';
           diffSpan.style.border = '1px solid rgba(251, 191, 36, 0.25)';
@@ -856,4 +850,4 @@ if (document.readyState === 'complete' || document.readyState === 'interactive')
   injectSpacedRepetitionReminder();
 } else {
   window.addEventListener('DOMContentLoaded', injectSpacedRepetitionReminder);
-}
+}

@@ -71,3 +71,9 @@ This bundles the extension into `dist/`.
 npm test
 ```
 Runs the Vitest suite covering UI components, accessibility, lifecycle hooks, and interaction safety.
+
+---
+
+## 📬 Contact
+
+Questions, feedback, or data-deletion requests: **codecoach.work@gmail.com**

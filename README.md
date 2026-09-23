@@ -144,5 +144,10 @@ cd extension; npm test
 
 ---
 
+## 📬 Contact
+Questions, feedback, or data-deletion requests: **codecoach.work@gmail.com**
+
+---
+
 ## 📄 License
 MIT License © 2026 Anisha Dhoot
