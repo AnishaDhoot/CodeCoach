@@ -2370,7 +2370,10 @@ export default function App() {
             AI Daily Limit: {aiQuota.limit - aiQuota.used}/{aiQuota.limit} left
           </span>
         )}
-        <span className="footer-version">CodeCoach{EXT_VERSION ? ` v${EXT_VERSION}` : ''}</span>
+        <span className="footer-version">
+          <a className="footer-contact" href="mailto:codecoach.work@gmail.com" title="codecoach.work@gmail.com">Contact</a>
+          {EXT_VERSION ? <span>· v{EXT_VERSION}</span> : null}
+        </span>
       </div>
     </div>
   );
