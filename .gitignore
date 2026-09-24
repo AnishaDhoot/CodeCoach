@@ -28,3 +28,6 @@ backend/.env
 backend/.pytest_cache/
 *.log
 
+
+# Local build zips
+Claude outputs/
