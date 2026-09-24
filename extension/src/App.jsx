@@ -144,8 +144,19 @@ export default function App() {
 
   // resetEditor=true only on page load: wiping the editor on later refreshes
   // (e.g. after a Wrong Answer) would destroy the user's in-progress work.
+  // Tests the user has ended (abandoned / submitted / expired) in this page.
+  // A slower status poll that was already in flight can still report such a
+  // test as active; without this it would pop the ended test back up, so the
+  // user had to click "Abandon Test" twice.
+  const endedTestIdsRef = useRef(new Set());
+  const isEndedTest = (data) => !!data && endedTestIdsRef.current.has(data.id);
+  const markTestEnded = (test) => {
+    if (test && test.id != null) endedTestIdsRef.current.add(test.id);
+  };
+
   const fetchActiveTest = (retriesLeft = 4, { resetEditor = false } = {}) => {
     chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
+      if (res && res.success && isEndedTest(res.data)) return; // stale: ignore
       if (res && res.success) {
         // Backend responded authoritatively.
         if (res.data) {
@@ -216,13 +227,22 @@ export default function App() {
 
   const abandonBadgeTest = () => {
     if (window.confirm && !window.confirm('Are you sure you want to abandon this Badge Test? All progress for this test will be lost.')) return;
+    const endedTest = activeTest;
+    markTestEnded(endedTest);
     writeCachedActiveTest(null);
     setActiveTest(null);
     setActiveTab('mastery');
     if (window.dsaTutor?.setAssessmentLocked) {
       window.dsaTutor.setAssessmentLocked(false);
     }
-    chrome.runtime.sendMessage({ action: 'abandon_badge_test' }, () => {
+    chrome.runtime.sendMessage({ action: 'abandon_badge_test' }, (res) => {
+      if (res && res.success === false) {
+        // The server didn't record it (e.g. offline): don't pretend it worked.
+        if (endedTest) endedTestIdsRef.current.delete(endedTest.id);
+        alert(res.error || 'Could not abandon the Badge Test. Please try again.');
+        fetchActiveTest();
+        return;
+      }
       fetchMastery();
     });
   };
@@ -231,6 +251,7 @@ export default function App() {
     chrome.runtime.sendMessage({ action: 'submit_badge_test' }, (res) => {
       setShowBadgeSubmitConfirm(false);
       if (res && res.success) {
+        markTestEnded(activeTest);
         if (res.data?.passed) {
           setBadgeAwardModal({
             topic: res.data.topic || activeTest?.topic,
@@ -764,7 +785,7 @@ export default function App() {
     if (!activeTest) return;
     const pollInterval = setInterval(() => {
       chrome.runtime.sendMessage({ action: 'get_active_badge_test' }, (res) => {
-        if (res && res.success && res.data) {
+        if (res && res.success && res.data && !isEndedTest(res.data)) {
           setActiveTest(mergeOptimisticSolved(res.data));
         }
       });
@@ -786,6 +807,7 @@ export default function App() {
   // Handle expiry outside the state updater (updaters must stay side-effect free).
   useEffect(() => {
     if (!hasActiveTest || testTimerSeconds > 0) return;
+    markTestEnded(activeTest);
     writeCachedActiveTest(null);
     setActiveTest(null);
     fetchMastery();
@@ -862,7 +884,7 @@ export default function App() {
       showBadgeAwardModal: (awardData) => {
         setBadgeAwardModal(awardData);
         writeCachedActiveTest(null);
-        setActiveTest(null);
+        setActiveTest(prev => { markTestEnded(prev); return null; });
         setActiveTab('mastery');
         fetchMastery();
       },

@@ -1,4 +1,4 @@
-# 🧩 CodeCoach Agent — Chrome Extension (Manifest V3)
+# 🧩 CodeCoach — Chrome Extension (Manifest V3)
 
 > A modern, high-performance Chrome Extension built with **React 18**, **Vite**, and **Shadow DOM Isolation**, designed to augment LeetCode with real-time AI code coaching, test-driven badge progression, fairplay locks, and 3-question mock interviews.
 

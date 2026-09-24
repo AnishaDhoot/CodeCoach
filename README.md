@@ -1,4 +1,4 @@
-# 🧠 CodeCoach Agent — Autonomous LeetCode Companion
+# 🧠 CodeCoach — Autonomous LeetCode Companion
 
 > An intelligent, autonomous Data Structures & Algorithms (DSA) CodeCoach overlay for LeetCode. Features conceptual failure diagnostics, test-driven badge topic mastery scoring, progressive 3-stage hint revealing, formal Badge Tests with celebratory badge unlocking modals, spaced repetition reviews, strict fairplay locks against past submission answers, and premium problem filtering.
 
